@@ -1,0 +1,8 @@
+networkx>=3.0
+matplotlib>=3.7
+selenium>=4.0
+requests>=2.28
+beautifulsoup4>=4.11
+ollama>=0.1
+cryptography>=41        # HTTPS-interception CA + per-host leaf certs (proxy)
+Pillow>=9              # Site Structure tree node icons

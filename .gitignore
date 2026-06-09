@@ -1,0 +1,91 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ---- Testing / coverage ----
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+nosetests.xml
+coverage.xml
+*.cover
+
+# ---- Reconner runtime / output ----
+# Scan results, exports, saved graphs/sessions
+*.reconner
+*.session
+scans/
+output/
+results/
+exports/
+reports/
+*.log
+logs/
+
+# Proxy / HTTPS-interception CA + per-host leaf certs
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+ca/
+certs/
+
+# Selenium / browser artifacts
+chromedriver
+geckodriver
+*.png.tmp
+screenshots/
+
+# Ollama model blobs (built locally via build-reconner-ai.sh)
+*.bin
+*.gguf
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Secrets / local config ----
+.env
+.env.*
+*.local
+config.local.*
