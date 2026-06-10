@@ -213,6 +213,7 @@ DEFAULT_SETTINGS = {
     'icon_resolution':  'Low',        # graph node-icon detail: High/Medium/Low
     'window_geometry':  '',
     'browser_geometry': '',
+    'wizard_geometry':  '',           # Wizard popup last position/size (WxH+X+Y)
     # Safe-path whitelist (allowlist). When enabled, the crawler only auto-sends
     # state-changing (non-GET) requests — probing endpoints and recovering their
     # parameters — to URLs whose path matches one of these globs; passive GET
@@ -7999,15 +8000,19 @@ class SettingsDialog(ModalToplevel):
     options (font size, icon resolution) and view the About tab. Calls
     `on_apply` with the gathered settings dict when applied."""
     def __init__(self, parent, settings, on_apply, ai,
-                 get_log=None, clear_log=None):
+                 get_log=None, clear_log=None,
+                 on_clear_wizard_chat=None, on_clear_wizard_memory=None):
         """Copy the current settings, build the tabbed UI and centre the dialog
-        over its parent. `get_log`/`clear_log` back the Logs tab."""
+        over its parent. `get_log`/`clear_log` back the Logs tab;
+        `on_clear_wizard_chat`/`on_clear_wizard_memory` back the AI-tab buttons."""
         super().__init__(parent)
         self.settings = dict(settings)
         self.on_apply = on_apply
         self.ai = ai
         self.get_log = get_log
         self.clear_log = clear_log
+        self.on_clear_wizard_chat = on_clear_wizard_chat
+        self.on_clear_wizard_memory = on_clear_wizard_memory
 
         self.title('Settings')
         self.configure(bg=C['bg'])
@@ -8089,6 +8094,42 @@ class SettingsDialog(ModalToplevel):
                  length=200, sliderlength=16, font=C['font']).pack(side='left')
         tk.Label(tf, textvariable=self._temp_var, bg=C['bg'],
                  font=C['font_b'], width=4).pack(side='left', padx=4)
+
+        # Wizard memory controls (below the temperature slider).
+        ttk.Separator(page, orient='horizontal').grid(
+            row=6, column=0, columnspan=2, sticky='ew', pady=8)
+        tk.Label(page, text='Wizard:', bg=C['bg'], font=C['font_b'],
+                 anchor='w', width=14).grid(row=7, column=0, sticky='w', pady=6)
+        wf = tk.Frame(page, bg=C['bg'])
+        wf.grid(row=7, column=1, sticky='w', padx=(6, 0), pady=6)
+        Btn(wf, text='Clear chat history',
+            command=self._clear_wizard_chat).pack(side='left')
+        Btn(wf, text='Clear AI memory',
+            command=self._clear_wizard_memory).pack(side='left', padx=(8, 0))
+
+    def _clear_wizard_chat(self):
+        """Delete the Wizard's raw chat-history log (~/.wizard-ai/conversation.json)."""
+        if not messagebox.askyesno(
+                'Clear chat history',
+                "Delete the Wizard's saved chat history?\n"
+                "(Its distilled memory is kept — clear that separately.)",
+                parent=self):
+            return
+        WizardMemory.clear_log()
+        if self.on_clear_wizard_chat:
+            self.on_clear_wizard_chat()
+
+    def _clear_wizard_memory(self):
+        """Delete the Wizard's distilled AI memory (~/.wizard-ai/memory.md)."""
+        if not messagebox.askyesno(
+                'Clear AI memory',
+                "Erase the Wizard's distilled memory of earlier findings?\n"
+                "It will no longer recall prior sessions.",
+                parent=self):
+            return
+        WizardMemory.clear_notes()
+        if self.on_clear_wizard_memory:
+            self.on_clear_wizard_memory()
 
     def _tab_interface(self, nb):
         """Build the Interface tab (font size)."""
@@ -8342,7 +8383,7 @@ class SettingsDialog(ModalToplevel):
         page = tk.Frame(nb, bg=C['bg'], padx=14, pady=14)
         nb.add(page, text='  About  ')
 
-        tk.Label(page, text='Reconner  v1.2', bg=C['bg'], fg=C['black'],
+        tk.Label(page, text='Reconner  v1.3', bg=C['bg'], fg=C['black'],
                  font=('MS Sans Serif', 12, 'bold')).pack(anchor='w')
         tk.Label(page, text='AI-powered bug bounty reconnaissance tool.',
                  bg=C['bg'], fg=C['black'], font=C['font']).pack(anchor='w', pady=(4, 10))
@@ -8642,7 +8683,8 @@ class RequestEditorDialog(ModalToplevel):
         self._do_has_response = False
         self._do_base_url = node.url
         self._do_sel_raw = None
-        self.encode_var = tk.BooleanVar(value=False)
+        self._enc_vars = make_encode_vars()      # URL / Base64 / Hex (one at a time)
+        self._enc_mode = encode_mode_getter(self._enc_vars)
         self.title(f'Repeater — {node.url[:80]}')
         self.configure(bg=C['bg'])
 
@@ -8674,8 +8716,8 @@ class RequestEditorDialog(ModalToplevel):
         cont, self.req_txt, self.body_txt, self.resp_txt, self.resp_body_txt = \
             _build_req_resp_fixed(self.in_frame)
         cont.pack(fill='both', expand=True)
-        _bind_urlencode(self.req_txt, self.encode_var.get)
-        _bind_urlencode(self.body_txt, self.encode_var.get)
+        _bind_encode(self.req_txt, self._enc_mode)
+        _bind_encode(self.body_txt, self._enc_mode)
         bar = tk.Frame(self.in_frame, bg=C['bg'])
         bar.pack(fill='x', pady=(6, 0))
         self.send_btn = Btn(bar, text='  Send  ', command=self._send,
@@ -8686,10 +8728,7 @@ class RequestEditorDialog(ModalToplevel):
         self.save_btn = Btn(bar, text='Save as New Node',
                             command=self._save_as_node, state='disabled')
         self.save_btn.pack(side='left', padx=6)
-        tk.Checkbutton(bar, text='URL-encode typing', variable=self.encode_var,
-                       bg=C['bg'], activebackground=C['bg'],
-                       selectcolor=C['window'], highlightthickness=0,
-                       font=C['font']).pack(side='right')
+        build_encode_checks(bar, self._enc_vars, suffix='typing', side='right')
 
         # ── Data Out view: list (top 2/3) of requests the node can use, one per
         #    line with horizontal scroll; selecting one loads it into the editor
@@ -8732,15 +8771,13 @@ class RequestEditorDialog(ModalToplevel):
         self.do_save_btn = Btn(dobar, text='Save as New Node',
                                command=self._do_save, state='disabled')
         self.do_save_btn.pack(side='left', padx=6)
-        tk.Checkbutton(dobar, text='URL-encode typing', variable=self.encode_var,
-                       bg=C['bg'], activebackground=C['bg'],
-                       selectcolor=C['window'], highlightthickness=0,
-                       font=C['font']).pack(side='right')
+        # Same shared encode vars as the Data In bar, so the two stay in sync.
+        build_encode_checks(dobar, self._enc_vars, suffix='typing', side='right')
         docont, self.do_req_txt, self.do_body_txt, self.do_resp_txt, \
             self.do_resp_body_txt = _build_req_resp_fixed(ea)
         docont.pack(side='top', fill='both', expand=True)
-        _bind_urlencode(self.do_req_txt, self.encode_var.get)
-        _bind_urlencode(self.do_body_txt, self.encode_var.get)
+        _bind_encode(self.do_req_txt, self._enc_mode)
+        _bind_encode(self.do_body_txt, self._enc_mode)
 
         # Populate the Data Out list, one request per line.
         self._do_items = []
@@ -8992,8 +9029,12 @@ class FuzzerDialog(ModalToplevel):
         self.results: list[tuple[str, int, int, str, str]] = []
         self._running = False
         self._stop_requested = False
-        self.encode_var = tk.BooleanVar(value=False)
-        self.payload_encode_var = tk.BooleanVar(value=False)
+        # Encode-typing (request/body) and encode-payloads — each URL/Base64/Hex,
+        # one active at a time.
+        self._enc_vars = make_encode_vars()
+        self._enc_mode = encode_mode_getter(self._enc_vars)
+        self._pl_enc_vars = make_encode_vars()
+        self._pl_enc_mode = encode_mode_getter(self._pl_enc_vars)
 
         self.title(f'Fuzzer — {node.url[:80]}')
         self.configure(bg=C['bg'])
@@ -9007,10 +9048,7 @@ class FuzzerDialog(ModalToplevel):
         tk.Label(rlab,
                  text='Request (mark positions with  {{FUZZ1}} {{FUZZ2}} … ):',
                  bg=C['bg'], font=C['font_b']).pack(side='left')
-        tk.Checkbutton(rlab, text='URL-encode typing', variable=self.encode_var,
-                       bg=C['bg'], activebackground=C['bg'],
-                       selectcolor=C['window'], highlightthickness=0,
-                       font=C['font']).pack(side='right')
+        build_encode_checks(rlab, self._enc_vars, suffix='typing', side='right')
         rf = tk.Frame(wrap, bg=C['bg'])
         rf.pack(fill='both', expand=True, pady=(2, 4))
         self.req_txt = EditText95(rf, height=8)
@@ -9018,7 +9056,7 @@ class FuzzerDialog(ModalToplevel):
         self.req_txt.config(yscrollcommand=rsb.set)
         self.req_txt.pack(side='left', fill='both', expand=True)
         rsb.pack(side='right', fill='y')
-        _bind_urlencode(self.req_txt, self.encode_var.get)
+        _bind_encode(self.req_txt, self._enc_mode)
 
         # Dedicated body editor — sent verbatim as the request body. {{FUZZn}}
         # positions may be placed here too (e.g. to fuzz a value in the body).
@@ -9031,7 +9069,7 @@ class FuzzerDialog(ModalToplevel):
         self.body_txt.config(yscrollcommand=bsb.set)
         self.body_txt.pack(side='left', fill='both', expand=True)
         bsb.pack(side='right', fill='y')
-        _bind_urlencode(self.body_txt, self.encode_var.get)
+        _bind_encode(self.body_txt, self._enc_mode)
 
         # ── Middle: fuzz positions + per-position payloads ──────────────
         # Multiple positions are supported: mark them in the request with
@@ -9050,13 +9088,10 @@ class FuzzerDialog(ModalToplevel):
         self.pos_label = tk.Label(ptop, text='Payloads (one per line):',
                                   bg=C['bg'], font=C['font_b'])
         self.pos_label.pack(side='left')
-        # URL-encode each payload before it's substituted into the request —
-        # applies to payloads whether typed or loaded from a wordlist file.
-        tk.Checkbutton(ptop, text='URL-encode payloads',
-                       variable=self.payload_encode_var,
-                       bg=C['bg'], activebackground=C['bg'],
-                       selectcolor=C['window'], highlightthickness=0,
-                       font=C['font']).pack(side='left', padx=(12, 0))
+        # Encode each payload (URL / Base64 / Hex, one at a time) before it's
+        # substituted into the request — applies whether typed or loaded from a
+        # wordlist file.
+        build_encode_checks(ptop, self._pl_enc_vars, suffix='payloads', side='left')
         Btn(ptop, text='Insert position',
             command=self._insert_marker).pack(side='right', padx=2)
         Btn(ptop, text='Load Wordlist',
@@ -9460,7 +9495,7 @@ class FuzzerDialog(ModalToplevel):
         ms = _make_int_matcher(self.ms_var.get())
         fc = _make_int_matcher(self.fc_var.get())
         fs = _make_int_matcher(self.fs_var.get())
-        encode_payloads = self.payload_encode_var.get()
+        payload_mode = self._pl_enc_mode()      # '' / 'url' / 'base64' / 'hex'
         marker_sets = [self._marker_strings(n) for n in positions]
 
         def worker():
@@ -9473,7 +9508,7 @@ class FuzzerDialog(ModalToplevel):
                     break
                 raw_req = template
                 for marks, payload in zip(marker_sets, combo):
-                    value = quote(payload, safe='') if encode_payloads else payload
+                    value = _encode_value(payload, payload_mode)
                     for mk in marks:
                         raw_req = raw_req.replace(mk, value)
                 r, raw = send_raw_request(raw_req, base)
@@ -10067,35 +10102,64 @@ class helper:
         return '\n'.join(lines).rstrip()
 
     @staticmethod
-    def _urlencode_keypress(event, enabled):
-        """`<Key>` handler for request editors: when `enabled()` is true, a typed
-        character that isn't URL-unreserved is replaced with its percent-encoding
-        (space → %20, ' → %27, < → %3C, …). Unreserved chars (A-Za-z0-9-_.~),
-        control keys (Enter/Tab/Backspace), and Ctrl-shortcuts pass through. Returns
-        'break' when it inserts the encoded form so the literal char isn't also
-        inserted by Tk's default binding."""
+    def _encode_value(text, mode):
+        """Encode a whole string per `mode`: 'url' (percent-encode every byte),
+        'hex' (lowercase hex of the UTF-8 bytes), 'base64' (standard base64), or
+        '' / None (unchanged). Used for fuzzer payloads."""
+        if not mode or not text:
+            return text
+        if mode == 'url':
+            return quote(text, safe='')
+        if mode == 'hex':
+            return text.encode('utf-8', 'replace').hex()
+        if mode == 'base64':
+            return base64.b64encode(text.encode('utf-8', 'replace')).decode('ascii')
+        return text
+
+    @staticmethod
+    def _encode_keypress(event, mode_getter):
+        """`<Key>` handler for request editors: transform the typed character per
+        the active encoding mode returned by `mode_getter()` so a payload can be
+        typed in already-encoded form. Modes:
+          'url'    — percent-encode non-unreserved chars (A-Za-z0-9-_.~ pass through)
+          'hex'    — every char → its UTF-8 bytes as hex ('A' → 41, ' ' → 20)
+          'base64' — every char → base64 of its UTF-8 bytes (per character)
+          '' / None — pass through unchanged
+        Control keys (Enter/Tab/Backspace), control chars and Ctrl-shortcuts always
+        pass through. Returns 'break' when it inserts the encoded form so the
+        literal char isn't also inserted by Tk's default binding."""
         try:
-            if not enabled():
+            mode = mode_getter()
+            if not mode:
                 return None
             ch = event.char
             if not ch or len(ch) != 1:
                 return None
-            if event.state & 0x4:
+            if event.state & 0x4:          # Ctrl held → shortcut, leave alone
                 return None
             o = ord(ch)
-            if o < 0x20 or o == 0x7f:
+            if o < 0x20 or o == 0x7f:      # control char (Enter/Tab/…) passes
                 return None
-            if ch.isascii() and (ch.isalnum() or ch in '-_.~'):
+            if mode == 'url':
+                if ch.isascii() and (ch.isalnum() or ch in '-_.~'):
+                    return None
+                enc = quote(ch, safe='')
+            elif mode == 'hex':
+                enc = ch.encode('utf-8', 'replace').hex()
+            elif mode == 'base64':
+                enc = base64.b64encode(
+                    ch.encode('utf-8', 'replace')).decode('ascii')
+            else:
                 return None
-            event.widget.insert('insert', quote(ch, safe=''))
+            event.widget.insert('insert', enc)
             return 'break'
         except Exception:
             return None
 
     @staticmethod
-    def _bind_urlencode(widget, enabled):
-        """Make `widget` auto-URL-encode typed characters while `enabled()` is true."""
-        widget.bind('<Key>', lambda e: _urlencode_keypress(e, enabled))
+    def _bind_encode(widget, mode_getter):
+        """Make `widget` auto-encode typed characters per `mode_getter()`."""
+        widget.bind('<Key>', lambda e: helper._encode_keypress(e, mode_getter))
 
     @staticmethod
     def fingerprint_target(url: str, should_stop=None, mode=None) -> str:
@@ -10229,9 +10293,45 @@ _passes_filters = helper._passes_filters
 compute_data_in = helper.compute_data_in
 compute_data_out = helper.compute_data_out
 format_data_out = helper.format_data_out
-_urlencode_keypress = helper._urlencode_keypress
-_bind_urlencode = helper._bind_urlencode
+_encode_keypress = helper._encode_keypress
+_bind_encode = helper._bind_encode
+_encode_value = helper._encode_value
 fingerprint_target = helper.fingerprint_target
+
+
+def make_encode_vars():
+    """Three BooleanVars backing the URL / Base64 / Hex encode-mode checkboxes."""
+    return {'url': tk.BooleanVar(value=False),
+            'base64': tk.BooleanVar(value=False),
+            'hex': tk.BooleanVar(value=False)}
+
+
+def encode_mode_getter(mvars):
+    """A callable returning the active mode ('url'/'base64'/'hex') or '' (none)."""
+    return lambda: next((m for m, v in mvars.items() if v.get()), '')
+
+
+def build_encode_checks(parent, mvars, suffix='typing', side='right'):
+    """Pack three mutually-exclusive encode checkboxes (URL / Base64 / Hex) into
+    `parent`, sharing `mvars` (so multiple groups on the same vars stay in sync).
+    Checking one clears the others; all-off means no encoding. Visual order reads
+    URL · Base64 · Hex regardless of the pack side."""
+    def toggle(active):
+        if mvars[active].get():
+            for k, v in mvars.items():
+                if k != active:
+                    v.set(False)
+    order = [('url', f'URL-encode {suffix}'),
+             ('base64', f'Base64-encode {suffix}'),
+             ('hex', f'Hex-encode {suffix}')]
+    if side == 'right':
+        order = list(reversed(order))
+    for mode, text in order:
+        tk.Checkbutton(parent, text=text, variable=mvars[mode],
+                       command=lambda m=mode: toggle(m),
+                       bg=C['bg'], activebackground=C['bg'],
+                       selectcolor=C['window'], highlightthickness=0,
+                       font=C['font']).pack(side=side)
 
 
 # ─────────────────────────────────────────────
@@ -11918,7 +12018,8 @@ class ProxyPanel(tk.Frame):
         self.on_save_node = on_save_node
         self.on_repeat_node = on_repeat_node
         self._current = None            # the ProxyFlow being shown, or None
-        self.encode_var = tk.BooleanVar(value=False)
+        self._enc_vars = make_encode_vars()      # URL / Base64 / Hex (one at a time)
+        self._enc_mode = encode_mode_getter(self._enc_vars)
         self.history = []               # every relayed transaction (records)
         self._history_win = None        # the open ProxyHistoryDialog, if any
         self._build()
@@ -11965,16 +12066,14 @@ class ProxyPanel(tk.Frame):
                                   resp_label='Response Header',
                                   resp_body_label='Response Body',
                                   req_editable=True, resp_editable=True)
-        # Bottom bar (URL-encode typing pinned to the bottom-right), packed before
-        # the editor so it stays anchored to the bottom edge.
+        # Bottom bar (encode-typing checkboxes pinned to the bottom-right), packed
+        # before the editor so it stays anchored to the bottom edge.
         botbar = tk.Frame(self, bg=C['bg'])
         botbar.pack(side='bottom', fill='x', padx=6, pady=(0, 4))
-        tk.Checkbutton(botbar, text='URL-encode typing', variable=self.encode_var,
-                       bg=C['bg'], activebackground=C['bg'], selectcolor=C['window'],
-                       highlightthickness=0, font=C['font']).pack(side='right')
+        build_encode_checks(botbar, self._enc_vars, suffix='typing', side='right')
         cont.pack(fill='both', expand=True, padx=6, pady=(2, 4))
-        _bind_urlencode(self.req_txt, self.encode_var.get)
-        _bind_urlencode(self.body_txt, self.encode_var.get)
+        _bind_encode(self.req_txt, self._enc_mode)
+        _bind_encode(self.body_txt, self._enc_mode)
         self._show_empty()
 
     # ── status / intercept toggle ──
@@ -12296,15 +12395,16 @@ class MerlinAgent:
 
 
 class WizardAnimator:
-    """Drives the Merlin sprite on a Tk Label through the animation cycles defined
-    in anim.txt. One frame loop runs at a time (`.after`-driven, honouring each
-    frame's own duration); a separate timer schedules the idle rests. A single
-    generalised "looped state" (intro → repeating loop → optional outro → `then`)
-    powers the listening / thinking / sending cycles; the outro target is chosen at
-    stop time so the same machinery handles "deselect → idle" vs "send → thinking".
+    """Drives the Merlin sprite on a Tk Label, following each clippy.js animation's
+    own frame graph (`branching` + `exitBranch`) so the looping "…-ing" animations
+    cycle SEAMLESSLY — exactly as the asset intended — instead of being restarted
+    from frame 0 (which stuttered). A self-looping animation runs continuously until
+    `end_loop()` asks it to exit, at which point it follows its `exitBranch` path to
+    a graceful end. Names the loaded agent lacks are skipped.
 
-    Names that the loaded agent lacks are skipped, so a different agent still runs.
-    """
+    Cycles (anim.txt): open → idle (random moves with rests) → listening (read loop)
+    while typing → thinking (loop) while the model is silent → sending (write loop)
+    while output streams → close; plus a trick on a Reconner-widget click."""
 
     OPEN = ['Announce', 'Greet', 'Wave', 'Show']
     CLOSE = ['Greet', 'Wave', 'Hide']
@@ -12312,15 +12412,14 @@ class WizardAnimator:
             'Idle2_1', 'Idle2_2', 'Idle3_1', 'Idle3_2']
     LISTEN_START = ['Confused', 'Hearing_1', 'Hearing_2', 'Hearing_3', 'Hearing_4',
                     'StartListening']
-    # (intro, looped, outro) — outro None means the loop just ends.
-    THINK_VARIANTS = [('Think', 'Thinking', None),
-                      ('Search', 'Searching', None),
-                      ('Read', 'ReadContinued', 'ReadReturn')]
-    SEND_VARIANTS = [('Write', 'WriteContinued', 'WriteReturn'),
-                     ('Process', 'Processing', None)]
-    TRICKS = ['Congratulate', 'Congratulate_2', '__magic__']  # magic = DoMagic1+2
+    # Self-looping animations (loop via `branching`, exit via `exitBranch`).
+    LISTEN_LOOPS = ['Reading']
+    THINK_LOOPS = ['Reading', 'Processing', 'Thinking', 'Searching']
+    SEND_LOOPS = ['Writing', 'Processing']
+    TRICKS = ['Congratulate', 'Congratulate_2', 'DoMagic1', 'DoMagic2']
     REST = 'RestPose'
     IDLE_REST_MS = (7000, 14000)        # random RestPose spell between idle moves
+    _EXIT_GUARD = 80                    # max steps while exiting (loop-path safety)
 
     def __init__(self, stage_label, agent, tk_widget):
         """`stage_label` is painted on; `agent` is the MerlinAgent; `tk_widget` is
@@ -12329,19 +12428,28 @@ class WizardAnimator:
         self.agent = agent
         self.tk = tk_widget
         self._mode = 'off'              # off/open/idle/listening/thinking/sending/
-        #                                 outro/trick/close
+        #                                 trick/close
         self._frame_after = None
         self._gap_after = None
+        self._idle_exit_after = None
+        self._wind_after = None
         self._cur_photo = None
-        # current looped-state config
-        self._loop = None
-        self._loop_outro = None
+        # active frame-graph run
+        self._cur_anim = None
+        self._cur_frames = []
+        self._cur_idx = 0
+        self._on_end = None
+        self._exit = False
+        self._exit_steps = 0
+        # active loop state
+        self._loop_anim = None
         self._loop_then = None
         self._loop_stop = False
 
-    # ── low-level frame playback ──
+    # ── frame-graph playback (clippy.js semantics) ──
     def _show(self, anim, idx):
-        """Paint frame `idx` of `anim`, keeping a ref so Tk can't GC it."""
+        """Paint frame `idx` of `anim` (a frame with no image leaves the last one
+        up), keeping a ref so Tk can't GC it."""
         photo = self.agent.frame_image(anim, idx)
         if photo is not None:
             try:
@@ -12350,39 +12458,71 @@ class WizardAnimator:
                 return
             self._cur_photo = photo
 
-    def _play(self, anim, on_done=None):
-        """Play `anim` once, then call `on_done`. Replaces any running animation."""
+    def _run(self, anim, on_end=None):
+        """Play `anim` by following its branching/exitBranch graph; `on_end` fires
+        when it reaches a terminal frame. Replaces any running animation."""
         self._cancel_frames()
         frames = self.agent.frames(anim)
         if not frames:
-            if on_done:
-                self._frame_after = self.tk.after(1, on_done)
+            self._frame_after = self.tk.after(1, on_end) if on_end else None
             return
-        st = {'i': 0}
+        self._cur_anim = anim
+        self._cur_frames = frames
+        self._cur_idx = 0
+        self._exit = False
+        self._exit_steps = 0
+        self._on_end = on_end
+        self._step()
 
-        def step():
-            i = st['i']
-            if i >= len(frames):
-                self._frame_after = None
-                if on_done:
-                    on_done()
-                return
-            self._show(anim, i)
-            dur = self.agent.duration(anim, i)
-            st['i'] += 1
-            self._frame_after = self.tk.after(dur, step)
-        step()
+    def _step(self):
+        """Show the current frame, then schedule the next per the frame graph."""
+        frames = self._cur_frames
+        i = self._cur_idx
+        if i < 0 or i >= len(frames):
+            self._frame_after = None
+            cb, self._on_end = self._on_end, None
+            if cb:
+                cb()
+            return
+        frame = frames[i]
+        self._show(self._cur_anim, i)
+        dur = max(20, int(frame.get('duration', 100) or 0))
+        self._cur_idx = self._next_index(frame, i)
+        self._frame_after = self.tk.after(dur, self._step)
 
-    def _play_sequence(self, anims, on_done=None):
-        """Play a list of animations back to back, then call `on_done`."""
+    def _next_index(self, frame, i):
+        """Next frame index: exitBranch while exiting, else a weighted `branching`
+        pick, else the following frame."""
+        if self._exit:
+            self._exit_steps += 1
+            if self._exit_steps > self._EXIT_GUARD:
+                return len(self._cur_frames)        # force terminal
+            eb = frame.get('exitBranch')
+            return int(eb) if eb is not None else i + 1
+        br = frame.get('branching')
+        if br and br.get('branches'):
+            rnd = random.random() * 100
+            for b in br['branches']:
+                w = b.get('weight', 0)
+                if rnd <= w:
+                    return int(b['frameIndex'])
+                rnd -= w
+        return i + 1
+
+    def request_exit(self):
+        """Tell the running animation to wind down via its exitBranch path."""
+        self._exit = True
+
+    def _play_sequence(self, anims, on_end=None):
+        """Play a list of (one-shot) animations back to back, then call `on_end`."""
         q = [a for a in anims if a]
 
         def nxt():
             if not q:
-                if on_done:
-                    on_done()
+                if on_end:
+                    on_end()
                 return
-            self._play(q.pop(0), nxt)
+            self._run(q.pop(0), nxt)
         nxt()
 
     def _pick(self, names):
@@ -12399,71 +12539,89 @@ class WizardAnimator:
             self._frame_after = None
 
     def _cancel_gap(self):
-        if self._gap_after is not None:
-            try:
-                self.tk.after_cancel(self._gap_after)
-            except Exception:
-                pass
-            self._gap_after = None
+        """Cancel both the idle-rest timer and the idle-loop wind-down nudge (any
+        mode transition calls this, so a stray nudge can't exit a later cycle)."""
+        for attr in ('_gap_after', '_idle_exit_after', '_wind_after'):
+            t = getattr(self, attr, None)
+            if t is not None:
+                try:
+                    self.tk.after_cancel(t)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
     def stop(self):
         """Halt everything (teardown)."""
         self._mode = 'off'
+        self._on_end = None
         self._cancel_frames()
         self._cancel_gap()
 
-    # ── generalised looped state (listening / thinking / sending) ──
-    def _begin_loop(self, intro, loop, outro):
-        """Play `intro`, then repeat `loop` until `end_loop` is called, then play
-        `outro` (if any) and run the stored `then`. Does NOT clear `_loop_stop` —
-        a stop requested during the cycle's intro (before the loop starts) must
-        still be honoured; each cycle-start method clears it instead."""
-        self._loop = loop
-        self._loop_outro = outro
-        self._play(intro, self._loop_step)
+    # ── seamless loop (listening / thinking / sending) ──
+    def _start_loop(self, anim):
+        """Run a self-looping animation; it cycles smoothly until `end_loop()`."""
+        self._loop_anim = anim
+        self._run(anim, self._loop_ended)
 
-    def _loop_step(self):
-        """One pass of the active loop, or its wind-down once stop was requested."""
-        if self._mode not in ('listening', 'thinking', 'sending'):
-            return
+    def _loop_ended(self):
+        """The loop reached a terminal frame: if a stop was requested, finish;
+        otherwise the asset's own loop ran out, so restart it (at its designed
+        seam, not a hard jump to frame 0)."""
         if self._loop_stop:
-            then = self._loop_then or self.start_idle
-            self._mode = 'outro'
-            if self._loop_outro and self.agent.frames(self._loop_outro):
-                self._play(self._loop_outro, then)
-            else:
-                then()
-            return
-        self._play(self._loop, self._loop_step)
+            self._finish_loop()
+        else:
+            self._run(self._loop_anim, self._loop_ended)
 
-    def _end_loop(self, then):
-        """Ask the active loop to finish (outro → `then`). If a loop isn't running
-        yet (still in its intro) the request is honoured when the intro ends; if no
-        loop is active at all, `then` runs immediately."""
+    def end_loop(self, then):
+        """Wind the active loop (or intro) down and then run `then`. Asks the
+        animation to play its exitBranch tail, but force-finishes after a short
+        window so a freeze/loop-on-exit animation (e.g. Hearing/StartListening)
+        can't stall the transition."""
         self._loop_then = then
         self._loop_stop = True
-        if self._mode not in ('listening', 'thinking', 'sending'):
-            then()
+        if self._frame_after is None:
+            self._finish_loop()
+            return
+        self.request_exit()
+        if self._wind_after is None:
+            self._wind_after = self.tk.after(500, self._finish_loop)
+
+    def _finish_loop(self):
+        """Run the pending `then` exactly once (from either the exit-tail reaching
+        a terminal frame, or the wind-down timeout)."""
+        if self._wind_after is not None:
+            try:
+                self.tk.after_cancel(self._wind_after)
+            except Exception:
+                pass
+            self._wind_after = None
+        if not self._loop_stop or self._loop_then is None:
+            return
+        then = self._loop_then
+        self._loop_then = None
+        self._loop_stop = False
+        self._cancel_frames()
+        then()
 
     # ── open / close ──
     def play_open(self, then):
         """Open cycle: one random greeting, then `then` (idle)."""
         self._mode = 'open'
         self._cancel_gap()
-        self._play(self._pick(self.OPEN), then)
+        self._run(self._pick(self.OPEN), then)
 
     def play_close(self, on_done):
         """Close cycle: one random farewell (greet/wave/hide), then `on_done`."""
         self._mode = 'close'
         self._cancel_gap()
-        self._cancel_frames()
-        self._play(self._pick(self.CLOSE), on_done)
+        self._run(self._pick(self.CLOSE), on_done)
 
     # ── idle ──
     def start_idle(self):
         """Idle cycle: rest, then random idle moves with random 7–14 s rests."""
         self._mode = 'idle'
         self._cancel_gap()
+        self._cancel_frames()
         self._show(self.REST, 0)
         self._schedule_idle()
 
@@ -12479,113 +12637,219 @@ class WizardAnimator:
             return
 
         def after_idle():
+            if self._idle_exit_after is not None:
+                try:
+                    self.tk.after_cancel(self._idle_exit_after)
+                except Exception:
+                    pass
+                self._idle_exit_after = None
             if self._mode != 'idle':
                 return
             self._show(self.REST, 0)
             self._schedule_idle()
-        self._play(self._pick(self.IDLE), after_idle)
+        self._run(self._pick(self.IDLE), after_idle)
+        # Some idle moves (Idle2_*/Idle3_*) self-loop forever; nudge them to wind
+        # down via exitBranch after a short random spell so the cycle keeps moving.
+        self._idle_exit_after = self.tk.after(
+            random.randint(2500, 5000), self.request_exit)
 
     # ── listening (user typing in chat) ──
     def start_listening(self):
-        """Typing cycle: a random listen-start (confused/hearing/startlistening),
-        then read → readcontinued loop. Only engages from idle."""
+        """Typing cycle: a brief listen-start pose (confused/hearing/startlistening,
+        which freeze rather than end), then a seamless reading loop. The lead-in is
+        time-boxed (not waited on to terminate). Only engages from idle."""
         if self._mode != 'idle':
             return
         self._mode = 'listening'
         self._cancel_gap()
         self._loop_then = self.start_idle
         self._loop_stop = False
+        self._run(self._pick(self.LISTEN_START))      # plays / freezes, no on_end
+        self._gap_after = self.tk.after(
+            random.randint(800, 1400), self._listen_to_read)
 
-        def to_read():
-            if self._mode != 'listening':
-                return
-            self._begin_loop('Read', 'ReadContinued', 'ReadReturn')
-        self._play(self._pick(self.LISTEN_START), to_read)
+    def _listen_to_read(self):
+        """Lead-in finished: drop into the reading loop (unless a stop is pending)."""
+        self._gap_after = None
+        if self._mode != 'listening':
+            return
+        if self._loop_stop:
+            self._finish_loop()
+        else:
+            self._start_loop(self._pick(self.LISTEN_LOOPS))
 
     def end_listening(self):
-        """Chat deselected without sending: gracefully wind the read loop down
-        (readreturn) and return to idle."""
-        self._end_loop(self.start_idle)
-
-    def _reading(self):
-        """True while a read-style loop is actually running (so we know to play a
-        ReadReturn before interrupting it)."""
-        return (self._mode in ('listening', 'thinking')
-                and self._loop == 'ReadContinued'
-                and self.agent.frames('ReadReturn'))
+        """Chat deselected without sending: wind the read loop down → idle."""
+        self.end_loop(self.start_idle)
 
     def go_thinking(self):
-        """User sent input: switch to the thinking cycle NOW (a quick ReadReturn
-        first if we were reading), interrupting any listening intro — so thinking
-        always shows promptly rather than waiting on a long wind-down."""
-        if self._reading():
-            self._mode = 'outro'
-            self._play('ReadReturn', self.start_thinking)
+        """User sent input: switch to the thinking cycle, winding down a listening
+        loop first if one is running."""
+        if self._mode in ('listening',):
+            self.end_loop(self.start_thinking)
         else:
             self.start_thinking()
 
     # ── thinking (model is silent) ──
     def start_thinking(self):
-        """Thinking cycle: confused, then a random think/search/read loop."""
+        """Thinking cycle: confused, then a seamless think/read/search loop."""
         self._mode = 'thinking'
         self._cancel_gap()
         self._loop_then = self.start_idle
         self._loop_stop = False
-        avail = [v for v in self.THINK_VARIANTS if self.agent.frames(v[1])]
-        intro, loop, outro = random.choice(avail) if avail else \
-            ('Think', 'Thinking', None)
+        loop = self._pick(self.THINK_LOOPS)
 
-        def after_confused():
+        def after_intro():
             if self._mode != 'thinking':
                 return
-            self._begin_loop(intro, loop, outro)
+            if self._loop_stop:
+                self._loop_ended()
+            else:
+                self._start_loop(loop)
         if self.agent.frames('Confused'):
-            self._play('Confused', after_confused)
+            self._run('Confused', after_intro)
         else:
-            after_confused()
+            after_intro()
 
     def thinking_to_sending(self):
-        """Output started: switch to the sending cycle NOW (a quick ReadReturn
-        first if the thinking variant was reading), interrupting the thinking loop
-        — so the sending/writing animation always shows while output streams."""
-        if self._reading():
-            self._mode = 'outro'
-            self._play('ReadReturn', self.start_sending)
-        else:
-            self.start_sending()
+        """Output started: wind the thinking loop down and begin the sending loop
+        so the writing animation shows while output streams."""
+        self.end_loop(self.start_sending)
 
     # ── sending (output is streaming) ──
     def start_sending(self):
-        """Sending cycle: a random write→writecontinued→writereturn or
-        process→processing loop."""
+        """Sending cycle: a seamless writing/processing loop."""
         self._mode = 'sending'
         self._cancel_gap()
         self._loop_then = self.start_idle
         self._loop_stop = False
-        avail = [v for v in self.SEND_VARIANTS if self.agent.frames(v[1])]
-        intro, loop, outro = random.choice(avail) if avail else \
-            ('Write', 'WriteContinued', 'WriteReturn')
-        self._begin_loop(intro, loop, outro)
+        self._start_loop(self._pick(self.SEND_LOOPS))
 
     def stop_sending(self):
-        """Output finished: play the outro (writereturn) and return to idle."""
-        self._end_loop(self.start_idle)
+        """Output finished: wind the writing loop down → idle."""
+        self.end_loop(self.start_idle)
 
     # ── trick (clicking a Reconner widget) ──
     def trick(self):
-        """A random celebration — only while idle, so it never interrupts a
-        listening/thinking/sending cycle."""
+        """A random celebration (DoMagic1/DoMagic2/Congratulate/…) — only while
+        idle, so it never interrupts a listening/thinking/sending cycle."""
         if self._mode != 'idle':
             return
         self._mode = 'trick'
         self._cancel_gap()
-        choice = random.choice([t for t in self.TRICKS
-                                if t == '__magic__'
-                                or self.agent.frames(t)] or [self.REST])
-        if choice == '__magic__':
-            self._play_sequence(['DoMagic1', 'DoMagic2'], self.start_idle)
-        else:
-            self._play(choice, self.start_idle)
+        self._run(self._pick(self.TRICKS), self.start_idle)
+
+
+class WizardMemory:
+    """Two-tier persistent store for the Wizard, in ~/.wizard-ai/:
+
+      • conversation.json — the running CHAT HISTORY (a log of raw exchanges). It
+        is NOT replayed into the chat (each open starts fresh) and is NOT fed back
+        as context; it's a record you can clear ("Clear chat history").
+      • memory.md — distilled AI MEMORY: a terse bullet list of durable findings
+        (targets, endpoints, vulns, what worked/failed). This IS injected as
+        silent context on every request, so the Wizard answers consistently about
+        earlier discoveries even in a brand-new chat. It's refreshed by a
+        background model pass when a chat closes, and cleared by "Clear AI memory".
+
+    All file operations fail silently — a memory hiccup must never break the chat.
+    """
+
+    DIR = os.path.expanduser('~/.wizard-ai')
+    LOG_FILE = 'conversation.json'
+    NOTES_FILE = 'memory.md'
+    LOG_MAX = 400                # messages kept in the raw log
+    NOTES_MAX = 4000             # characters kept in the distilled notes
+
+    @classmethod
+    def _p(cls, name):
+        return os.path.join(cls.DIR, name)
+
+    # ── distilled AI memory (memory.md) ──
+    @classmethod
+    def load_notes(cls):
+        """The distilled memory text ('' when absent)."""
+        try:
+            with open(cls._p(cls.NOTES_FILE), encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception:
+            return ''
+
+    @classmethod
+    def save_notes(cls, text):
+        try:
+            os.makedirs(cls.DIR, exist_ok=True)
+            with open(cls._p(cls.NOTES_FILE), 'w', encoding='utf-8') as f:
+                f.write((text or '').strip()[:cls.NOTES_MAX] + '\n')
+        except Exception:
+            pass
+
+    @classmethod
+    def clear_notes(cls):
+        try:
+            os.remove(cls._p(cls.NOTES_FILE))
+        except Exception:
+            pass
+
+    # ── raw chat history (conversation.json) ──
+    @classmethod
+    def append_log(cls, messages):
+        """Append exchanges (list of {role, content}) to the running chat log."""
+        try:
+            os.makedirs(cls.DIR, exist_ok=True)
+            prior = []
+            try:
+                with open(cls._p(cls.LOG_FILE), encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, list):
+                        prior = loaded
+            except Exception:
+                prior = []
+            prior.extend({'role': m['role'], 'content': m['content']}
+                         for m in messages if m.get('role') in ('user', 'assistant'))
+            with open(cls._p(cls.LOG_FILE), 'w', encoding='utf-8') as f:
+                json.dump(prior[-cls.LOG_MAX:], f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    @classmethod
+    def clear_log(cls):
+        try:
+            os.remove(cls._p(cls.LOG_FILE))
+        except Exception:
+            pass
+
+    # ── distillation (runs on a background thread when a chat closes) ──
+    @classmethod
+    def distill(cls, ai, model, session):
+        """Fold `session` (list of {role, content}) into the distilled notes via
+        the model, and save them. Blocking — call from a daemon thread."""
+        if not session or ai is None:
+            return
+        prior = cls.load_notes()
+        convo = '\n'.join(
+            f"{'User' if m['role'] == 'user' else 'Wizard'}: {m['content']}"
+            for m in session if m.get('role') in ('user', 'assistant'))
+        if not convo.strip():
+            return
+        prompt = (
+            "You keep terse running notes for an AUTHORISED security engagement. "
+            "Merge the latest CONVERSATION into the CURRENT NOTES and output the "
+            "UPDATED notes as a short plain bullet list of durable facts worth "
+            "remembering: targets/hosts, endpoints and paths, discovered "
+            "vulnerabilities and exactly where, techniques that worked or failed, "
+            "useful payloads, credentials, flags. Keep prior facts, add new ones, "
+            "drop chit-chat. Under 30 lines. Output ONLY the bullet list — no "
+            "preamble, no flourish.\n\n"
+            f"CURRENT NOTES:\n{prior or '(none yet)'}\n\n"
+            f"CONVERSATION:\n{convo}\n\nUPDATED NOTES:")
+        try:
+            notes = ai.chat_stream([{'role': 'user', 'content': prompt}],
+                                   model=model)
+            if notes and not notes.lstrip().startswith('['):
+                cls.save_notes(notes)
+        except Exception:
+            pass
 
 
 class WizardAssistantDialog(tk.Toplevel):
@@ -12593,17 +12857,27 @@ class WizardAssistantDialog(tk.Toplevel):
     greets on open, idles with rests, reacts while you type in the chat, thinks
     while `wizard-ai` is silent, performs a contextual sending animation while it
     streams its reply, celebrates when you click a Reconner widget, and plays a
-    farewell on close (deferring the close until the animation finishes)."""
+    farewell on close (deferring the close until the animation finishes).
 
-    def __init__(self, parent, agent, ai, model='wizard-ai'):
-        """Build over a loaded MerlinAgent + the app's `ollama` client."""
+    Each chat starts FRESH (no replayed output). Continuity comes from
+    WizardMemory (~/.wizard-ai/): the distilled `memory.md` is injected as silent
+    context so the Wizard recalls earlier findings, while the raw chat log is kept
+    separately. Right-click the wizard to clear the current chat."""
+
+    def __init__(self, parent, agent, ai, model='wizard-ai',
+                 geometry='', on_geometry=None):
+        """Build over a loaded MerlinAgent + the app's `ollama` client. `geometry`
+        ('WxH+X+Y') restores the last position/size; `on_geometry(geom)` is called
+        with the current geometry when the popup closes so it can be remembered."""
         super().__init__(parent, bg=C['bg'])
         self.agent = agent
         self.ai = ai
         self.model = model
+        self.on_geometry = on_geometry
         self.title('Wizard')
         self.configure(bg=C['bg'])
-        self.history = []
+        self.history = []                       # fresh session (nothing replayed)
+        self.memory_notes = WizardMemory.load_notes()   # silent distilled context
         self._busy = False
         self._closing = False
         self._stream_cancel = False
@@ -12612,11 +12886,20 @@ class WizardAssistantDialog(tk.Toplevel):
         self._app_click_bind = None
         self.animator = None
         self._build()
+        # Restore the last position/size (after _build so it isn't overridden by
+        # geometry-propagation from the children).
+        if geometry:
+            try:
+                self.geometry(geometry)
+            except tk.TclError:
+                pass
         if not self.agent.available():
             self._show_error()
             self.protocol('WM_DELETE_WINDOW', self.destroy)
             return
         self.animator = WizardAnimator(self.stage, self.agent, self)
+        # Right-click the wizard to clear the current chat.
+        self.stage.bind('<Button-3>', self._on_forget_menu)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         # Clicking any Reconner widget (in the main window) triggers a trick — the
         # toplevel is in every child widget's bindtags, so one bind catches them
@@ -12756,6 +13039,30 @@ class WizardAssistantDialog(tk.Toplevel):
         self.transcript.insert('end', text + '\n\n')
         self.transcript.see('end')
 
+    def _context_messages(self):
+        """Silent priming that injects the distilled memory (memory.md) as MEMORIES
+        of past, separate sessions — not current-conversation facts. The framing
+        tells the model to surface a memory only when relevant, and always as an
+        explicit recollection ('I recall…'), so it never asserts a remembered fact
+        as something the seeker just said. Empty when there are no notes."""
+        if not self.memory_notes:
+            return []
+        return [
+            {'role': 'user', 'content':
+                "(MEMORY — these are your private recollections from EARLIER, "
+                "SEPARATE sessions with this seeker. They are NOT part of the "
+                "current conversation and may have nothing to do with what is asked "
+                "now. Rules: do not assume any of this applies to the current "
+                "question; never restate a memory as though the seeker just told "
+                "you; only bring a memory up when it is clearly relevant, and when "
+                "you do, phrase it explicitly as a recollection — e.g. 'I recall "
+                "that once you ran into X; back then we…'.)\n\nMEMORIES:\n"
+                + self.memory_notes},
+            {'role': 'assistant', 'content':
+                "Understood — those are memories of past sessions. I will only "
+                "recall one if it is relevant, and clearly as a recollection."},
+        ]
+
     def _send(self, *_):
         """Send the input to wizard-ai: readreturn → thinking → (stream) sending."""
         if self._busy or self._closing:
@@ -12779,11 +13086,13 @@ class WizardAssistantDialog(tk.Toplevel):
         self._drain()
 
     def _run_stream(self, history):
-        """Worker thread: stream into a thread-safe queue (never touches Tk)."""
+        """Worker thread: stream into a thread-safe queue (never touches Tk). The
+        distilled memory is prepended as silent context."""
         def on_token(chunk):
             self._q.put(('tok', chunk))
+        messages = self._context_messages() + history
         full = self.ai.chat_stream(
-            history, model=self.model, on_token=on_token,
+            messages, model=self.model, on_token=on_token,
             is_cancelled=lambda: self._stream_cancel)
         self._q.put(('done', full))
 
@@ -12825,8 +13134,13 @@ class WizardAssistantDialog(tk.Toplevel):
         self.transcript.insert('end', '\n\n')
         self.transcript.see('end')
         reply = ''.join(self._wiz_buf) or full
-        if reply:
+        if reply and not reply.startswith('[AI error') \
+                and not reply.startswith('[Ollama'):
             self.history.append({'role': 'assistant', 'content': reply})
+            # Append the exchange to the raw chat-history log and keep the live
+            # session context bounded. (Distilled memory is refreshed on close.)
+            WizardMemory.append_log(self.history[-2:])
+            del self.history[:-30]
         self._busy = False
         self.entry.config(state='normal')
         self.entry.focus_set()
@@ -12845,16 +13159,58 @@ class WizardAssistantDialog(tk.Toplevel):
         if self.animator is not None:
             self.animator.trick()
 
+    # ── memory ──
+    def _on_forget_menu(self, ev):
+        """Right-click the wizard: clear the current chat (its memory is separate,
+        cleared from Settings ▸ AI)."""
+        m = tk.Menu(self, tearoff=0, bg=C['btn'], fg=C['black'],
+                    activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
+                    font=C['font'])
+        m.add_command(label='Clear this chat', command=self._forget)
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
+
+    def _forget(self):
+        """Clear the current session: the live history and the transcript (the
+        distilled memory is untouched). Ignored mid-reply."""
+        if self._busy:
+            return
+        self.history = []
+        try:
+            self.transcript.delete('1.0', 'end')
+        except tk.TclError:
+            pass
+
+    def forget_memory(self):
+        """Drop this session's view of the distilled memory (after the file was
+        cleared from Settings) so it stops being injected as context."""
+        self.memory_notes = ''
+
     # ── close (deferred until the farewell animation finishes) ──
     def _on_close(self):
         if self._closing:
             return
         self._closing = True
         self._stream_cancel = True
+        # Remember the current position/size for next time (capture now, before
+        # the farewell animation and destroy).
+        if self.on_geometry is not None:
+            try:
+                self.on_geometry(self.geometry())
+            except Exception:
+                pass
         try:
             self.entry.config(state='disabled')
         except Exception:
             pass
+        # Fold this session's findings into the distilled memory (background).
+        if self.history:
+            session = list(self.history)
+            threading.Thread(
+                target=lambda: WizardMemory.distill(self.ai, self.model, session),
+                daemon=True).start()
         if self.animator is not None:
             self.animator.play_close(self._finish_close)
         else:
@@ -13570,7 +13926,29 @@ class app:
             return
         self._settings_popup = SettingsDialog(
             self.root, self.settings, self._on_settings_apply, self.ai,
-            get_log=self._get_log, clear_log=self._clear_log)
+            get_log=self._get_log, clear_log=self._clear_log,
+            on_clear_wizard_chat=self._wizard_clear_chat,
+            on_clear_wizard_memory=self._wizard_clear_memory)
+
+    def _wizard_clear_chat(self):
+        """Settings cleared the chat-history file — also reset an open Wizard's
+        current chat (transcript + session)."""
+        win = getattr(self, '_wizard_win', None)
+        if win is not None and win.winfo_exists():
+            try:
+                win._forget()
+            except Exception:
+                pass
+
+    def _wizard_clear_memory(self):
+        """Settings cleared the distilled memory — also drop an open Wizard's
+        in-session copy so it stops being injected as context."""
+        win = getattr(self, '_wizard_win', None)
+        if win is not None and win.winfo_exists():
+            try:
+                win.forget_memory()
+            except Exception:
+                pass
 
     def _on_settings_apply(self, s):
         """Apply newly-saved settings: update the AI client, concurrency limits and
@@ -13874,7 +14252,18 @@ class app:
             self._merlin_agent = MerlinAgent(scale=1.4)   # a bit bigger wizard
         self._wizard_win = WizardAssistantDialog(
             self.root, self._merlin_agent, self.ai,
-            model=self.settings.get('wizard_model', 'wizard-ai'))
+            model=self.settings.get('wizard_model', 'wizard-ai'),
+            geometry=self.settings.get('wizard_geometry', ''),
+            on_geometry=self._save_wizard_geometry)
+
+    def _save_wizard_geometry(self, geom):
+        """Remember the Wizard popup's last position/size for the next open."""
+        if geom and geom != self.settings.get('wizard_geometry', ''):
+            self.settings['wizard_geometry'] = geom
+            try:
+                save_settings(self.settings)
+            except Exception:
+                pass
 
     def _delete_node(self):
         """Remove the currently-selected node from the graph. Only nodes

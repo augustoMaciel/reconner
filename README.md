@@ -214,7 +214,7 @@ Reconner includes a ZAP/Burp-style intercepting proxy in the **Proxy** panel (to
 - **Open Browser** — launch your system browser (Firefox preferred, Chromium fallback) through the proxy in a dedicated profile, with the CA trusted, so you can browse and have traffic intercepted. Opens the Target URL if one is set, otherwise a blank page.
 - **History** — open the traffic-history popup (see below).
 - **Save as Node** (top-right) — add the displayed transaction to the Site Structure graph as a node (parented under its `Referer`). Enabled only once a request has been sent and its response caught.
-- **URL-encode typing** (bottom-right) — percent-encode what you type into the request boxes.
+- **Encode typing** (bottom-right) — three mutually-exclusive checkboxes (**URL-encode** / **Base64-encode** / **Hex-encode typing**) that transform characters as you type them into the request boxes, so you can enter a payload already encoded. The same trio appears in the Repeater and Fuzzer; the Fuzzer also has an **encode-payloads** trio that encodes each wordlist payload before it is sent.
 
 The four editor boxes (**Request Header / Request Body** over **Response Header / Response Body**, with a draggable splitter between headers and bodies) show the trapped request or response as raw HTTP. **Edit anything and forward** — both the request that gets sent and the response that gets delivered are taken from the boxes, so you can e.g. tamper a parameter on the way out or edit a response to bypass a client-side check. Every completed transaction is also added to the Site Structure tree. **Out-of-scope requests are never sent** (see Scope, above). The play/drop/Open-Browser buttons are greyed and blocked while Intercept is OFF.
 
@@ -243,6 +243,8 @@ Click the **wizard-hat button** next to *Nodes:* in the status bar to summon **T
 
 Type a question and press **Enter** — his reply streams into a yellow speech balloon. The animation is fully reactive: he **greets** on open, **idles** with little gestures, starts **listening** when you type, **thinks** while the model is silent, acts out a **writing** animation while the answer streams, and plays a **farewell** when you close the window (the close waits for it to finish). Click the wizard — or anything in the app — for a **trick**.
 
+Every chat **starts fresh** (nothing is replayed), but the Wizard keeps two kinds of state in `~/.wizard-ai/`: a raw **chat history** log (`conversation.json`) and a distilled **AI memory** (`memory.md`) — a terse bullet list of durable findings (targets, endpoints, vulnerabilities, what worked/failed) that's refreshed by a background pass when you close a chat. Only the distilled memory is fed back as silent context, so the Wizard recalls earlier discoveries (e.g. a vuln you found in `/pages`) even in a brand-new conversation, without re-printing the whole transcript. **Right-click the wizard** to clear the current chat; **Settings ▸ AI / Ollama** has **Clear chat history** and **Clear AI memory** buttons.
+
 > The Merlin sprites come from the open-source [clippy.js](https://github.com/pi0/clippyjs) assets and are expected at `~/Documents/Projects/Clippy/clippy.js/agents/Merlin/`. The artwork is Microsoft's — keep it to local/personal use. A standalone previewer of all 73 animations is included: `python3 merlin_anim_test.py`.
 
 ---
@@ -270,7 +272,7 @@ From **Options ▾** → **Export ALL graphs (JSON)**, Reconner writes a `reconn
   - **Safe-path whitelist** — the [safe-path whitelist](#safe-path-whitelist): on/off toggle and the editable list of paths Reconner may auto-probe (with **Reset** / **Load list…**).
 - **Proxy** — the intercepting proxy's listen **port** (default `8080`), the CA certificate path, and **Export CA cert…** / **Install into system trust** buttons (see [Proxy interceptor](#proxy-interceptor)).
 - **Interface** — font size.
-- Window and browser geometry are remembered automatically between sessions.
+- Window, browser, and Wizard-popup geometry (position + size) are remembered automatically between sessions.
 
 ---
 

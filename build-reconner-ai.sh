@@ -21,6 +21,7 @@ DEFAULT_BASE="qwen2.5-coder:7b-instruct-q4_K_M"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELFILE="${MODELFILE:-$SCRIPT_DIR/Modelfile.reconner-ai}"
 WIZARD_MODELFILE="${WIZARD_MODELFILE:-$SCRIPT_DIR/Modelfile.wizard-ai}"
+WIZARD_MEMORY_DIR="$HOME/.wizard-ai"
 SETTINGS="$HOME/.reconner/settings.json"
 
 DO_TEST=1
@@ -85,6 +86,10 @@ fi
 build_model "$MODEL_NAME" "$MODELFILE"
 if (( DO_WIZARD )); then
     build_model "$WIZARD_NAME" "$WIZARD_MODELFILE"
+    # Prepare the Wizard's persistent-memory folder (~/.wizard-ai) so the
+    # assistant can store/recall conversations on first run.
+    mkdir -p "$WIZARD_MEMORY_DIR"
+    ok "memory folder ready: $WIZARD_MEMORY_DIR"
 fi
 
 # ─── 3. smoke test ───────────────────────────────────────────────────────
