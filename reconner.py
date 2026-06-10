@@ -207,6 +207,7 @@ SETTINGS_FILE = SETTINGS_DIR / 'settings.json'
 DEFAULT_SETTINGS = {
     'ollama_host':      'http://localhost:11434',
     'model':            'reconner-ai',
+    'wizard_model':     'wizard-ai',      # conversational model for the Wizard
     'temperature':      0.7,
     'font_size':        8,
     'icon_resolution':  'Low',        # graph node-icon detail: High/Medium/Low
@@ -909,6 +910,41 @@ class ollama:
             return r['message']['content']
         except Exception as e:
             return f'[AI error: {e}]'
+
+    def chat_stream(self, messages, model=None, on_token=None,
+                    is_cancelled=None):
+        """Stream a multi-turn chat completion (used by the Wizard assistant).
+        `messages` is the conversation so far (the model's baked-in SYSTEM prompt
+        supplies the persona). `on_token(chunk)` is called per streamed chunk on
+        the CALLING thread; `is_cancelled()` (optional) lets the caller stop the
+        stream early. Returns the full text, or a bracketed error string (also
+        delivered through on_token) on failure / unavailability."""
+        if not OLLAMA_AVAILABLE:
+            msg = '[Ollama not installed: pip install ollama]'
+            if on_token:
+                on_token(msg)
+            return msg
+        mdl = model or self.model
+        parts = []
+        try:
+            for ev in self._client().chat(
+                    model=mdl, messages=messages, stream=True,
+                    options={'temperature': self.temperature}):
+                if is_cancelled and is_cancelled():
+                    break
+                chunk = (ev.get('message') or {}).get('content', '') \
+                    if isinstance(ev, dict) else getattr(
+                        getattr(ev, 'message', None), 'content', '')
+                if chunk:
+                    parts.append(chunk)
+                    if on_token:
+                        on_token(chunk)
+            return ''.join(parts)
+        except Exception as e:
+            err = f'[AI error: {e}]'
+            if on_token:
+                on_token(err)
+            return ''.join(parts) + err
 
 
 # ─────────────────────────────────────────────
@@ -6870,6 +6906,27 @@ def _app_icon_photo(target_px=31):
         return None
 
 
+def _merlin_hat_photo(target_px=18):
+    """The blue wizard-hat icon (reconner-icons/merlin-hat.png) as a Tk image
+    sized to target_px, or None if it can't be loaded. Requires a Tk root."""
+    path = os.path.join(_node_icon_dir(), 'merlin-hat.png')
+    if not os.path.isfile(path):
+        return None
+    try:
+        from PIL import Image, ImageTk
+        im = Image.open(path).convert('RGBA').resize(
+            (target_px, target_px), Image.LANCZOS)
+        return ImageTk.PhotoImage(im)
+    except Exception:
+        pass
+    try:
+        img = tk.PhotoImage(file=path)
+        f = max(1, round(img.width() / target_px))
+        return img.subsample(f, f)
+    except Exception:
+        return None
+
+
 # ─────────────────────────────────────────────
 # Panel 1 – Graph
 # ─────────────────────────────────────────────
@@ -7996,15 +8053,22 @@ class SettingsDialog(ModalToplevel):
         Entry95(page, textvariable=self._model_var).grid(
             row=0, column=1, sticky='ew', padx=(6, 0), pady=6)
 
-        tk.Label(page, text='Ollama Host:', bg=C['bg'], font=C['font_b'],
+        tk.Label(page, text='Wizard Model:', bg=C['bg'], font=C['font_b'],
                  anchor='w', width=14).grid(row=1, column=0, sticky='w', pady=6)
+        self._wizard_model_var = tk.StringVar(
+            value=self.settings.get('wizard_model', 'wizard-ai'))
+        Entry95(page, textvariable=self._wizard_model_var).grid(
+            row=1, column=1, sticky='ew', padx=(6, 0), pady=6)
+
+        tk.Label(page, text='Ollama Host:', bg=C['bg'], font=C['font_b'],
+                 anchor='w', width=14).grid(row=2, column=0, sticky='w', pady=6)
         self._host_var = tk.StringVar(
             value=self.settings.get('ollama_host', 'http://localhost:11434'))
         Entry95(page, textvariable=self._host_var).grid(
-            row=1, column=1, sticky='ew', padx=(6, 0), pady=6)
+            row=2, column=1, sticky='ew', padx=(6, 0), pady=6)
 
         status = tk.Frame(page, bg=C['bg'])
-        status.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(0, 6))
+        status.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(0, 6))
         self._conn_lbl = tk.Label(status, text='○  Not tested', bg=C['bg'],
                                   font=C['font'], fg=C['shadow'])
         self._conn_lbl.pack(side='left')
@@ -8012,12 +8076,12 @@ class SettingsDialog(ModalToplevel):
             command=self._test_connection).pack(side='right')
 
         ttk.Separator(page, orient='horizontal').grid(
-            row=3, column=0, columnspan=2, sticky='ew', pady=8)
+            row=4, column=0, columnspan=2, sticky='ew', pady=8)
 
         tk.Label(page, text='Temperature:', bg=C['bg'], font=C['font_b'],
-                 anchor='w', width=14).grid(row=4, column=0, sticky='w', pady=6)
+                 anchor='w', width=14).grid(row=5, column=0, sticky='w', pady=6)
         tf = tk.Frame(page, bg=C['bg'])
-        tf.grid(row=4, column=1, sticky='ew', padx=(6, 0), pady=6)
+        tf.grid(row=5, column=1, sticky='ew', padx=(6, 0), pady=6)
         self._temp_var = tk.DoubleVar(value=self.settings.get('temperature', 0.7))
         tk.Scale(tf, variable=self._temp_var, from_=0.0, to=2.0, resolution=0.05,
                  orient='horizontal', bg=C['bg'], fg=C['black'],
@@ -8317,6 +8381,7 @@ class SettingsDialog(ModalToplevel):
         """Collect the current widget values into a settings dict."""
         s = dict(self.settings)
         s['model']       = self._model_var.get().strip() or 'reconner-ai'
+        s['wizard_model'] = self._wizard_model_var.get().strip() or 'wizard-ai'
         s['ollama_host'] = self._host_var.get().strip().rstrip('/')
         s['temperature'] = round(float(self._temp_var.get()), 2)
         s['font_size']   = int(self._font_var.get())
@@ -12115,6 +12180,698 @@ class ProxyPanel(tk.Frame):
 
 
 # ─────────────────────────────────────────────
+# Merlin — Office-Assistant-style animated character (clippy.js assets)
+# ─────────────────────────────────────────────
+class MerlinAgent:
+    """Loader/animator for a clippy.js 'Merlin' agent. Parses the agent's
+    `agent.js` (a `clippy.ready('Merlin', {…})` wrapper around pure JSON) and its
+    `map.png` sprite sheet, then hands out composited per-frame ImageTk images and
+    each frame's duration. Pure data + image slicing — playback timing is driven by
+    whoever consumes it (the test dialog's `.after()` loop).
+
+    `agent.js` shape: `framesize` [w,h], `overlayCount`, and `animations` — a dict
+    of name → {frames:[{duration, images:[[x,y],…], …}]}. Each frame's `images`
+    are pixel offsets into the sheet (stacked overlays). The sheet has a real alpha
+    channel, so frames composite cleanly over any background."""
+
+    DEFAULT_DIR = os.path.expanduser(
+        '~/Documents/Projects/Clippy/clippy.js/agents/Merlin')
+
+    def __init__(self, assets_dir=None, scale=1.0):
+        """Load from `assets_dir` (default: the standard clippy.js Merlin path).
+        `scale` enlarges (or shrinks) the rendered character. On any failure
+        `available()` returns False and `error` explains why."""
+        self.dir = assets_dir or self.DEFAULT_DIR
+        self.scale = float(scale)
+        self.framesize = (128, 128)
+        self.animations = {}
+        self.error = ''
+        self._sheet = None              # PIL.Image (RGBA)
+        self._cache = {}                # (anim, idx) -> ImageTk.PhotoImage
+        self._load()
+
+    def display_size(self):
+        """The on-screen (scaled) frame size — what the stage Label should be."""
+        w, h = self.framesize
+        return (max(1, round(w * self.scale)), max(1, round(h * self.scale)))
+
+    def _load(self):
+        """Parse agent.js + open map.png; record `error` and bail on failure."""
+        agent = os.path.join(self.dir, 'agent.js')
+        sheet = os.path.join(self.dir, 'map.png')
+        try:
+            from PIL import Image          # noqa: F401  (probe availability)
+        except Exception:
+            self.error = 'Pillow (PIL) is not installed — pip install pillow.'
+            return
+        if not (os.path.isfile(agent) and os.path.isfile(sheet)):
+            self.error = (f'Merlin assets not found in:\n{self.dir}\n\n'
+                          'Expected agent.js + map.png (clippy.js Merlin agent).')
+            return
+        try:
+            raw = open(agent, encoding='utf-8', errors='replace').read()
+            m = re.search(r"clippy\.ready\(\s*'[^']*'\s*,\s*(\{.*\})\s*\)\s*;?\s*$",
+                          raw, re.S)
+            if not m:
+                self.error = 'agent.js is not in the expected clippy.ready(...) form.'
+                return
+            data = json.loads(m.group(1))
+            self.framesize = tuple(data.get('framesize', [128, 128]))
+            self.animations = data.get('animations', {})
+            from PIL import Image
+            self._sheet = Image.open(sheet).convert('RGBA')
+        except Exception as e:
+            self.error = f'Failed to load Merlin assets: {e}'
+            self.animations = {}
+
+    def available(self):
+        """True when the sheet + at least one animation loaded."""
+        return bool(self._sheet is not None and self.animations)
+
+    def names(self):
+        """Sorted animation names."""
+        return sorted(self.animations)
+
+    def frames(self, anim):
+        """The raw frame list for `anim` (empty when unknown)."""
+        a = self.animations.get(anim)
+        return a.get('frames', []) if a else []
+
+    def duration(self, anim, idx):
+        """Frame `idx`'s duration in ms (clamped to a sane minimum)."""
+        fr = self.frames(anim)
+        if 0 <= idx < len(fr):
+            return max(20, int(fr[idx].get('duration', 100)))
+        return 100
+
+    def frame_image(self, anim, idx):
+        """A cached ImageTk.PhotoImage for frame `idx` of `anim`: the frame's
+        overlay images composited over transparency. None when out of range or a
+        frame carries no image (a pure pause)."""
+        key = (anim, idx)
+        if key in self._cache:
+            return self._cache[key]
+        fr = self.frames(anim)
+        if not (self._sheet is not None and 0 <= idx < len(fr)):
+            return None
+        imgs = fr[idx].get('images') or []
+        if not imgs:
+            self._cache[key] = None
+            return None
+        from PIL import Image, ImageTk
+        w, h = self.framesize
+        canvas = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+        for off in imgs:
+            try:
+                x, y = int(off[0]), int(off[1])
+                tile = self._sheet.crop((x, y, x + w, y + h))
+                canvas.alpha_composite(tile)
+            except Exception:
+                continue
+        if self.scale != 1.0:
+            canvas = canvas.resize(self.display_size(), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(canvas)
+        self._cache[key] = photo
+        return photo
+
+
+class WizardAnimator:
+    """Drives the Merlin sprite on a Tk Label through the animation cycles defined
+    in anim.txt. One frame loop runs at a time (`.after`-driven, honouring each
+    frame's own duration); a separate timer schedules the idle rests. A single
+    generalised "looped state" (intro → repeating loop → optional outro → `then`)
+    powers the listening / thinking / sending cycles; the outro target is chosen at
+    stop time so the same machinery handles "deselect → idle" vs "send → thinking".
+
+    Names that the loaded agent lacks are skipped, so a different agent still runs.
+    """
+
+    OPEN = ['Announce', 'Greet', 'Wave', 'Show']
+    CLOSE = ['Greet', 'Wave', 'Hide']
+    IDLE = ['Idle1_1', 'Idle1_2', 'Idle1_3', 'Idle1_4',
+            'Idle2_1', 'Idle2_2', 'Idle3_1', 'Idle3_2']
+    LISTEN_START = ['Confused', 'Hearing_1', 'Hearing_2', 'Hearing_3', 'Hearing_4',
+                    'StartListening']
+    # (intro, looped, outro) — outro None means the loop just ends.
+    THINK_VARIANTS = [('Think', 'Thinking', None),
+                      ('Search', 'Searching', None),
+                      ('Read', 'ReadContinued', 'ReadReturn')]
+    SEND_VARIANTS = [('Write', 'WriteContinued', 'WriteReturn'),
+                     ('Process', 'Processing', None)]
+    TRICKS = ['Congratulate', 'Congratulate_2', '__magic__']  # magic = DoMagic1+2
+    REST = 'RestPose'
+    IDLE_REST_MS = (7000, 14000)        # random RestPose spell between idle moves
+
+    def __init__(self, stage_label, agent, tk_widget):
+        """`stage_label` is painted on; `agent` is the MerlinAgent; `tk_widget` is
+        any live widget used for `.after`."""
+        self.label = stage_label
+        self.agent = agent
+        self.tk = tk_widget
+        self._mode = 'off'              # off/open/idle/listening/thinking/sending/
+        #                                 outro/trick/close
+        self._frame_after = None
+        self._gap_after = None
+        self._cur_photo = None
+        # current looped-state config
+        self._loop = None
+        self._loop_outro = None
+        self._loop_then = None
+        self._loop_stop = False
+
+    # ── low-level frame playback ──
+    def _show(self, anim, idx):
+        """Paint frame `idx` of `anim`, keeping a ref so Tk can't GC it."""
+        photo = self.agent.frame_image(anim, idx)
+        if photo is not None:
+            try:
+                self.label.config(image=photo)
+            except tk.TclError:
+                return
+            self._cur_photo = photo
+
+    def _play(self, anim, on_done=None):
+        """Play `anim` once, then call `on_done`. Replaces any running animation."""
+        self._cancel_frames()
+        frames = self.agent.frames(anim)
+        if not frames:
+            if on_done:
+                self._frame_after = self.tk.after(1, on_done)
+            return
+        st = {'i': 0}
+
+        def step():
+            i = st['i']
+            if i >= len(frames):
+                self._frame_after = None
+                if on_done:
+                    on_done()
+                return
+            self._show(anim, i)
+            dur = self.agent.duration(anim, i)
+            st['i'] += 1
+            self._frame_after = self.tk.after(dur, step)
+        step()
+
+    def _play_sequence(self, anims, on_done=None):
+        """Play a list of animations back to back, then call `on_done`."""
+        q = [a for a in anims if a]
+
+        def nxt():
+            if not q:
+                if on_done:
+                    on_done()
+                return
+            self._play(q.pop(0), nxt)
+        nxt()
+
+    def _pick(self, names):
+        """A random animation the agent actually has (else RestPose)."""
+        avail = [n for n in names if self.agent.frames(n)]
+        return random.choice(avail) if avail else self.REST
+
+    def _cancel_frames(self):
+        if self._frame_after is not None:
+            try:
+                self.tk.after_cancel(self._frame_after)
+            except Exception:
+                pass
+            self._frame_after = None
+
+    def _cancel_gap(self):
+        if self._gap_after is not None:
+            try:
+                self.tk.after_cancel(self._gap_after)
+            except Exception:
+                pass
+            self._gap_after = None
+
+    def stop(self):
+        """Halt everything (teardown)."""
+        self._mode = 'off'
+        self._cancel_frames()
+        self._cancel_gap()
+
+    # ── generalised looped state (listening / thinking / sending) ──
+    def _begin_loop(self, intro, loop, outro):
+        """Play `intro`, then repeat `loop` until `end_loop` is called, then play
+        `outro` (if any) and run the stored `then`. Does NOT clear `_loop_stop` —
+        a stop requested during the cycle's intro (before the loop starts) must
+        still be honoured; each cycle-start method clears it instead."""
+        self._loop = loop
+        self._loop_outro = outro
+        self._play(intro, self._loop_step)
+
+    def _loop_step(self):
+        """One pass of the active loop, or its wind-down once stop was requested."""
+        if self._mode not in ('listening', 'thinking', 'sending'):
+            return
+        if self._loop_stop:
+            then = self._loop_then or self.start_idle
+            self._mode = 'outro'
+            if self._loop_outro and self.agent.frames(self._loop_outro):
+                self._play(self._loop_outro, then)
+            else:
+                then()
+            return
+        self._play(self._loop, self._loop_step)
+
+    def _end_loop(self, then):
+        """Ask the active loop to finish (outro → `then`). If a loop isn't running
+        yet (still in its intro) the request is honoured when the intro ends; if no
+        loop is active at all, `then` runs immediately."""
+        self._loop_then = then
+        self._loop_stop = True
+        if self._mode not in ('listening', 'thinking', 'sending'):
+            then()
+
+    # ── open / close ──
+    def play_open(self, then):
+        """Open cycle: one random greeting, then `then` (idle)."""
+        self._mode = 'open'
+        self._cancel_gap()
+        self._play(self._pick(self.OPEN), then)
+
+    def play_close(self, on_done):
+        """Close cycle: one random farewell (greet/wave/hide), then `on_done`."""
+        self._mode = 'close'
+        self._cancel_gap()
+        self._cancel_frames()
+        self._play(self._pick(self.CLOSE), on_done)
+
+    # ── idle ──
+    def start_idle(self):
+        """Idle cycle: rest, then random idle moves with random 7–14 s rests."""
+        self._mode = 'idle'
+        self._cancel_gap()
+        self._show(self.REST, 0)
+        self._schedule_idle()
+
+    def _schedule_idle(self):
+        if self._mode != 'idle':
+            return
+        self._cancel_gap()
+        self._gap_after = self.tk.after(
+            random.randint(*self.IDLE_REST_MS), self._do_idle)
+
+    def _do_idle(self):
+        if self._mode != 'idle':
+            return
+
+        def after_idle():
+            if self._mode != 'idle':
+                return
+            self._show(self.REST, 0)
+            self._schedule_idle()
+        self._play(self._pick(self.IDLE), after_idle)
+
+    # ── listening (user typing in chat) ──
+    def start_listening(self):
+        """Typing cycle: a random listen-start (confused/hearing/startlistening),
+        then read → readcontinued loop. Only engages from idle."""
+        if self._mode != 'idle':
+            return
+        self._mode = 'listening'
+        self._cancel_gap()
+        self._loop_then = self.start_idle
+        self._loop_stop = False
+
+        def to_read():
+            if self._mode != 'listening':
+                return
+            self._begin_loop('Read', 'ReadContinued', 'ReadReturn')
+        self._play(self._pick(self.LISTEN_START), to_read)
+
+    def end_listening(self):
+        """Chat deselected without sending: gracefully wind the read loop down
+        (readreturn) and return to idle."""
+        self._end_loop(self.start_idle)
+
+    def _reading(self):
+        """True while a read-style loop is actually running (so we know to play a
+        ReadReturn before interrupting it)."""
+        return (self._mode in ('listening', 'thinking')
+                and self._loop == 'ReadContinued'
+                and self.agent.frames('ReadReturn'))
+
+    def go_thinking(self):
+        """User sent input: switch to the thinking cycle NOW (a quick ReadReturn
+        first if we were reading), interrupting any listening intro — so thinking
+        always shows promptly rather than waiting on a long wind-down."""
+        if self._reading():
+            self._mode = 'outro'
+            self._play('ReadReturn', self.start_thinking)
+        else:
+            self.start_thinking()
+
+    # ── thinking (model is silent) ──
+    def start_thinking(self):
+        """Thinking cycle: confused, then a random think/search/read loop."""
+        self._mode = 'thinking'
+        self._cancel_gap()
+        self._loop_then = self.start_idle
+        self._loop_stop = False
+        avail = [v for v in self.THINK_VARIANTS if self.agent.frames(v[1])]
+        intro, loop, outro = random.choice(avail) if avail else \
+            ('Think', 'Thinking', None)
+
+        def after_confused():
+            if self._mode != 'thinking':
+                return
+            self._begin_loop(intro, loop, outro)
+        if self.agent.frames('Confused'):
+            self._play('Confused', after_confused)
+        else:
+            after_confused()
+
+    def thinking_to_sending(self):
+        """Output started: switch to the sending cycle NOW (a quick ReadReturn
+        first if the thinking variant was reading), interrupting the thinking loop
+        — so the sending/writing animation always shows while output streams."""
+        if self._reading():
+            self._mode = 'outro'
+            self._play('ReadReturn', self.start_sending)
+        else:
+            self.start_sending()
+
+    # ── sending (output is streaming) ──
+    def start_sending(self):
+        """Sending cycle: a random write→writecontinued→writereturn or
+        process→processing loop."""
+        self._mode = 'sending'
+        self._cancel_gap()
+        self._loop_then = self.start_idle
+        self._loop_stop = False
+        avail = [v for v in self.SEND_VARIANTS if self.agent.frames(v[1])]
+        intro, loop, outro = random.choice(avail) if avail else \
+            ('Write', 'WriteContinued', 'WriteReturn')
+        self._begin_loop(intro, loop, outro)
+
+    def stop_sending(self):
+        """Output finished: play the outro (writereturn) and return to idle."""
+        self._end_loop(self.start_idle)
+
+    # ── trick (clicking a Reconner widget) ──
+    def trick(self):
+        """A random celebration — only while idle, so it never interrupts a
+        listening/thinking/sending cycle."""
+        if self._mode != 'idle':
+            return
+        self._mode = 'trick'
+        self._cancel_gap()
+        choice = random.choice([t for t in self.TRICKS
+                                if t == '__magic__'
+                                or self.agent.frames(t)] or [self.REST])
+        if choice == '__magic__':
+            self._play_sequence(['DoMagic1', 'DoMagic2'], self.start_idle)
+        else:
+            self._play(choice, self.start_idle)
+
+
+class WizardAssistantDialog(tk.Toplevel):
+    """The animated Wizard: a Merlin character that runs the anim.txt cycles —
+    greets on open, idles with rests, reacts while you type in the chat, thinks
+    while `wizard-ai` is silent, performs a contextual sending animation while it
+    streams its reply, celebrates when you click a Reconner widget, and plays a
+    farewell on close (deferring the close until the animation finishes)."""
+
+    def __init__(self, parent, agent, ai, model='wizard-ai'):
+        """Build over a loaded MerlinAgent + the app's `ollama` client."""
+        super().__init__(parent, bg=C['bg'])
+        self.agent = agent
+        self.ai = ai
+        self.model = model
+        self.title('Wizard')
+        self.configure(bg=C['bg'])
+        self.history = []
+        self._busy = False
+        self._closing = False
+        self._stream_cancel = False
+        self._first_token = True
+        self._wiz_buf = []
+        self._app_click_bind = None
+        self.animator = None
+        self._build()
+        if not self.agent.available():
+            self._show_error()
+            self.protocol('WM_DELETE_WINDOW', self.destroy)
+            return
+        self.animator = WizardAnimator(self.stage, self.agent, self)
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+        # Clicking any Reconner widget (in the main window) triggers a trick — the
+        # toplevel is in every child widget's bindtags, so one bind catches them
+        # all. Guarded to idle in the animator.
+        try:
+            self._app_click_bind = self.master.bind(
+                '<Button-1>', self._on_app_click, add='+')
+        except Exception:
+            self._app_click_bind = None
+        self.after(150, lambda: self.animator.play_open(self.animator.start_idle))
+
+    def _build(self):
+        """Wizard on the left, speech-balloon transcript on the right, with the
+        input spanning the full width of the popup along the bottom."""
+        # Full-width input along the popup's bottom edge (Enter sends — no button).
+        row = tk.Frame(self, bg=C['bg'])
+        row.pack(side='bottom', fill='x', padx=8, pady=(0, 8))
+        self.input_var = tk.StringVar()
+        self.entry = tk.Entry(row, textvariable=self.input_var, font=C['font'],
+                              relief='sunken', bd=2, bg=C['window'],
+                              highlightthickness=0)
+        self.entry.pack(fill='x', expand=True)
+
+        body = tk.Frame(self, bg=C['bg'])
+        body.pack(side='top', fill='both', expand=True, padx=8, pady=(8, 0))
+
+        # The wizard sits on the plain panel grey (like the Office Assistant).
+        left = tk.Frame(body, bg=C['bg'])
+        left.pack(side='left', fill='y')
+        w, h = self.agent.display_size() if self.agent.available() else (128, 128)
+        self.stage = tk.Label(left, bg=C['bg'], width=w, height=h,
+                              relief='flat', bd=0, cursor='hand2')
+        self.stage.pack(pady=(8, 0))
+        self.stage.bind('<Button-1>', lambda _e: self._on_trick())
+
+        right = tk.Frame(body, bg=C['bg'])
+        right.pack(side='left', fill='both', expand=True, padx=(8, 0))
+
+        # The transcript lives inside a pale-yellow speech balloon (a Canvas-drawn
+        # rounded box with a tail pointing at the wizard's head).
+        self._balloon_bg = '#fff59d'
+        self.balloon = tk.Canvas(right, bg=C['bg'], highlightthickness=0, bd=0)
+        self.balloon.pack(side='top', fill='both', expand=True)
+        inner = tk.Frame(self.balloon, bg=self._balloon_bg)
+        self.transcript = Text95(inner, width=40, height=14, wrap='word',
+                                 bg=self._balloon_bg, relief='flat', bd=0)
+        tsb = tk.Scrollbar(inner, orient='vertical',
+                           command=self.transcript.yview)
+        self.transcript.config(yscrollcommand=tsb.set)
+        self.transcript.pack(side='left', fill='both', expand=True)
+        tsb.pack(side='right', fill='y')
+        self.transcript.tag_config('you', foreground=C['title_bg'],
+                                   font=C['font_b'])
+        self.transcript.tag_config('wiz', foreground='#2e7d32',
+                                   font=C['font_b'])
+        self._balloon_win = self.balloon.create_window(0, 0, anchor='nw',
+                                                       window=inner)
+        self.balloon.bind('<Configure>', self._draw_balloon)
+        self.entry.bind('<Return>', self._send)
+        # Typing-in-chat cycle: engage only when the user actually TYPES (not on
+        # mere focus/selection), wind down on deselect.
+        self.entry.bind('<KeyPress>', self._on_entry_type)
+        self.entry.bind('<FocusOut>', self._on_entry_unfocus)
+        if self.agent.available():
+            self.entry.focus_set()
+
+    @staticmethod
+    def _round_rect(x1, y1, x2, y2, r):
+        """Point list for a rounded rectangle drawn as a smooth canvas polygon."""
+        return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+                x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+    def _draw_balloon(self, _e=None):
+        """Redraw the yellow speech balloon to fit the canvas and size the embedded
+        transcript inside it. Drawn as a rounded body + a tail on the left edge
+        pointing at the wizard; the tail/body seam is hidden with a fill-coloured
+        line so it reads as one balloon."""
+        c = self.balloon
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 40 or h < 40:
+            return
+        c.delete('shape')
+        pad, r, tail_w = 4, 16, 18
+        left, top, rgt, bot = pad + tail_w, pad, w - pad, h - pad
+        c.create_polygon(self._round_rect(left, top, rgt, bot, r), smooth=True,
+                         fill=self._balloon_bg, outline='#808080', width=1,
+                         tags='shape')
+        # Tail near the top so it lines up with the wizard's head (the stage sits
+        # at the top of the left column).
+        ty = top + 32
+        c.create_polygon(left, ty - 9, left, ty + 19, pad, ty + 7,
+                         fill=self._balloon_bg, outline='#808080', width=1,
+                         tags='shape')
+        # Erase the body/tail outline where they join.
+        c.create_line(left, ty - 9, left, ty + 19, fill=self._balloon_bg,
+                      width=2, tags='shape')
+        ipad = 12
+        c.coords(self._balloon_win, left + ipad, top + ipad)
+        c.itemconfig(self._balloon_win, width=rgt - left - 2 * ipad,
+                     height=bot - top - 2 * ipad)
+        c.tag_lower('shape')
+        c.tag_raise(self._balloon_win)
+
+    def _show_error(self):
+        for w in self.winfo_children():
+            w.destroy()
+        tk.Label(self, text='The Wizard cannot appear', bg=C['bg'],
+                 fg=C['err'], font=C['font_b']).pack(padx=16, pady=(16, 4))
+        tk.Message(self, text=self.agent.error or 'Unknown error.', bg=C['bg'],
+                   fg=C['black'], font=C['font'], width=380).pack(padx=16,
+                                                                  pady=(0, 8))
+        Btn(self, text=' Close ', command=self.destroy).pack(pady=(0, 14))
+
+    # ── typing-in-chat hooks ──
+    def _on_entry_type(self, e=None):
+        """Engage the listening cycle when the user actually TYPES in the chat
+        (not merely focuses/selects it). The Enter key is ignored here — it sends."""
+        if e is not None and e.keysym in ('Return', 'KP_Enter'):
+            return
+        if not (self._busy or self._closing) and self.animator is not None:
+            self.animator.start_listening()
+
+    def _on_entry_unfocus(self, _e=None):
+        """Deselecting the chat ends listening → idle — but only if it wasn't a
+        send (deferred so a Send-button click can flip _busy first)."""
+        self.after(1, self._maybe_deselect)
+
+    def _maybe_deselect(self):
+        if self._busy or self._closing or self.animator is None:
+            return
+        if self.animator._mode in ('listening', 'outro'):
+            self.animator.end_listening()
+
+    # ── chat ──
+    def _append(self, who, text, tag):
+        self.transcript.insert('end', f'{who}: ', tag)
+        self.transcript.insert('end', text + '\n\n')
+        self.transcript.see('end')
+
+    def _send(self, *_):
+        """Send the input to wizard-ai: readreturn → thinking → (stream) sending."""
+        if self._busy or self._closing:
+            return
+        text = self.input_var.get().strip()
+        if not text:
+            return
+        self.input_var.set('')
+        self._append('You', text, 'you')
+        self.history.append({'role': 'user', 'content': text})
+        self._busy = True
+        self._first_token = True
+        self._wiz_buf = []
+        self._stream_cancel = False
+        self._q = queue.Queue()
+        self.entry.config(state='disabled')   # no Send button — Enter sends
+        # listening → readreturn → thinking cycle (or straight to thinking).
+        self.animator.go_thinking()
+        threading.Thread(target=self._run_stream, args=(list(self.history),),
+                         daemon=True).start()
+        self._drain()
+
+    def _run_stream(self, history):
+        """Worker thread: stream into a thread-safe queue (never touches Tk)."""
+        def on_token(chunk):
+            self._q.put(('tok', chunk))
+        full = self.ai.chat_stream(
+            history, model=self.model, on_token=on_token,
+            is_cancelled=lambda: self._stream_cancel)
+        self._q.put(('done', full))
+
+    def _drain(self):
+        """UI thread: apply queued tokens/completion, reschedule while in flight."""
+        try:
+            while True:
+                kind, payload = self._q.get_nowait()
+                if kind == 'tok':
+                    self._on_token(payload)
+                else:
+                    self._on_done(payload)
+        except queue.Empty:
+            pass
+        if self._busy and not self._closing:
+            self.after(30, self._drain)
+
+    def _on_token(self, chunk):
+        """First chunk: thinking → sending + open the wizard's line; then stream."""
+        if self._closing:
+            return
+        if self._first_token:
+            self._first_token = False
+            self.transcript.insert('end', 'Wizard: ', 'wiz')
+            self.transcript.see('end')
+            self.animator.thinking_to_sending()
+        self._wiz_buf.append(chunk)
+        self.transcript.insert('end', chunk)
+        self.transcript.see('end')
+
+    def _on_done(self, full):
+        """Stream finished: close the line, record it, play the sending outro."""
+        if self._closing:
+            return
+        if self._first_token:
+            self.transcript.insert('end', 'Wizard: ', 'wiz')
+            self.transcript.insert('end', full or '…')
+            self.animator.thinking_to_sending()
+        self.transcript.insert('end', '\n\n')
+        self.transcript.see('end')
+        reply = ''.join(self._wiz_buf) or full
+        if reply:
+            self.history.append({'role': 'assistant', 'content': reply})
+        self._busy = False
+        self.entry.config(state='normal')
+        self.entry.focus_set()
+        self.animator.stop_sending()
+
+    # ── tricks ──
+    def _on_trick(self):
+        """Click on the wizard → a trick (when idle)."""
+        if self.animator and not self._closing:
+            self.animator.trick()
+
+    def _on_app_click(self, _e=None):
+        """Click on any Reconner widget → a trick (when the wizard is idle)."""
+        if self._closing or not self.winfo_exists():
+            return
+        if self.animator is not None:
+            self.animator.trick()
+
+    # ── close (deferred until the farewell animation finishes) ──
+    def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._stream_cancel = True
+        try:
+            self.entry.config(state='disabled')
+        except Exception:
+            pass
+        if self.animator is not None:
+            self.animator.play_close(self._finish_close)
+        else:
+            self._finish_close()
+
+    def _finish_close(self):
+        """Unhook the app-click bind, tear down the animator, destroy the window."""
+        if self._app_click_bind is not None:
+            try:
+                self.master.unbind('<Button-1>', self._app_click_bind)
+            except Exception:
+                pass
+            self._app_click_bind = None
+        if self.animator is not None:
+            self.animator.stop()
+        self.destroy()
+# ─────────────────────────────────────────────
 # gui — declarative (matrix-driven) widget construction
 # ─────────────────────────────────────────────
 class gui:
@@ -12355,10 +13112,23 @@ class gui:
         """One row per status-bar widget. The status (left, stretches) and the
         node count (right) carry live variables; the Ollama/Selenium badges show
         availability, computed here so the data row holds the final text/colour."""
+        # The Merlin button is packed before the node count so that — both being
+        # side='right' — it lands at the far right, immediately right of 'Nodes:'.
+        # Stash its hat icon on the app so Tk keeps a reference.
+        self.app._merlin_icon = _merlin_hat_photo(18)
+        merlin_btn = {'type': 'button', 'command': '_open_wizard',
+                      'attr': 'merlin_btn', 'side': 'right',
+                      'opts': {'padx': 4, 'pady': 1}}
+        if self.app._merlin_icon is not None:
+            merlin_btn['opts'].update(image=self.app._merlin_icon,
+                                      compound='center')
+        else:
+            merlin_btn['text'] = 'M'        # fallback if the PNG won't load
         rows = [
             {'type': 'label', 'var': 'status_var', 'var_value': 'Ready',
              'side': 'left', 'fill': 'x', 'expand': True,
              'opts': {'anchor': 'w', 'padx': 6}},
+            merlin_btn,
             {'type': 'label', 'var': 'count_var', 'var_value': 'Nodes: 0',
              'side': 'right', 'opts': {'padx': 8, 'relief': 'sunken'}},
         ]
@@ -12809,6 +13579,10 @@ class app:
         self.ai.model = s.get('model', 'reconner-ai')
         self.ai.host = s.get('ollama_host', '')
         self.ai.temperature = s.get('temperature', 0.7)
+        # Live-update an open Wizard so its next reply uses the new model.
+        win = getattr(self, '_wizard_win', None)
+        if win is not None and win.winfo_exists():
+            win.model = s.get('wizard_model', 'wizard-ai')
         # Concurrent-browser cap: apply live so raising it mid-scan immediately
         # frees slots for any queued subdomain crawls.
         self._MAX_CONCURRENT_SUBS = max(1, int(s.get('max_concurrent_browsers', 5)))
@@ -13086,6 +13860,21 @@ class app:
         """Open the Repeater seeded with a node built from a proxied transaction;
         any result it saves becomes an edited graph node."""
         inspector.repeater(self.root, node, on_save=self._add_edited_node)
+
+    def _open_wizard(self):
+        """Open (or focus) the animated Wizard assistant. The MerlinAgent (sprite)
+        is parsed once and reused; the dialog is a singleton and streams from the
+        configured conversational model (default wizard-ai)."""
+        win = getattr(self, '_wizard_win', None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            win.focus_force()
+            return
+        if getattr(self, '_merlin_agent', None) is None:
+            self._merlin_agent = MerlinAgent(scale=1.4)   # a bit bigger wizard
+        self._wizard_win = WizardAssistantDialog(
+            self.root, self._merlin_agent, self.ai,
+            model=self.settings.get('wizard_model', 'wizard-ai'))
 
     def _delete_node(self):
         """Remove the currently-selected node from the graph. Only nodes

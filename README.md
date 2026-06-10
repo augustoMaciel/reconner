@@ -10,7 +10,7 @@ Reconner drives a real browser to *navigate a target like a user would* — foll
 
 ## Highlights
 
-- **Intercepting proxy (HTTP + HTTPS)** — a built-in ZAP/Burp-style proxy (default `127.0.0.1:8080`). Flip **Intercept ON** and trap each request and response in a repeater-style 4-box editor: **▶** forward one step, **▶|** forward the request without trapping its response, **✕** drop. HTTPS is decrypted with an auto-generated CA (per-host certs minted on the fly). Click **Open Browser** to launch your system browser through the proxy (CA auto-trusted), or point any client at the port. Out-of-scope requests are never sent.
+- **Intercepting proxy (HTTP + HTTPS)** — a built-in ZAP/Burp-style proxy (default `127.0.0.1:8080`). Flip **Intercept ON** and trap each request and response in a repeater-style 4-box editor: **▶** forward one step, **✕** drop, **Save as Node** to keep a reviewed transaction in the graph. A **History** popup logs every relayed transaction — scope-filtered, searchable, sortable (incl. request/response size), with right-click **Send to Repeater** / **Save as Node** and JSON export. HTTPS is decrypted with an auto-generated CA (per-host certs minted on the fly). Click **Open Browser** to launch your system browser through the proxy (CA auto-trusted), or point any client at the port. Out-of-scope requests are never sent.
 - **Intercept-driven full-surface crawl** — start a scan while **Intercept is ON** and Reconner drops *all* safety gates (whitelist, destructive veto, safe-click heuristics) and routes the crawl browser through the proxy — so it exercises **everything** (every control, GET param, POST body, optional feature) and you vet each request in the interceptor before it goes out.
 - **User-like crawling** — a real browser (Chrome-first, Firefox fallback via Selenium) renders JavaScript, follows links, and clicks non-destructive controls so SPAs reveal their routes and API calls. The browser presents a normal (non-headless) User-Agent so WAF/CDN bot filters don't blanket-block the crawl.
 - **API endpoint discovery** — passively from live XHR/fetch + JS/response-body mining, and actively via spec/well-known probing (and a comprehensive wordlist in Aggressive mode). Real data endpoints are labeled `api`; binary downloads are correctly labeled `file`.
@@ -21,6 +21,7 @@ Reconner drives a real browser to *navigate a target like a user would* — foll
 - **Subdomain discovery** — passive (links, traffic, JS) plus certificate-transparency (crt.sh) in Aggressive mode, each subdomain getting its own graph and a full crawl. Discovery is **unbounded** (no cap on how many are found or crawled); the only limiter is the **Max concurrent browsers** setting, which throttles how many crawl at once while the rest queue.
 - **Tech fingerprinting** — servers, frameworks, CMSs, CDNs, WAFs, analytics, and more, with optional `whatweb` / `nmap` / `wafw00f` probes.
 - **AI analysis** — an optional local **Ollama** model (`reconner-ai`) summarizes a node's security-relevant details.
+- **The Wizard** — an animated Office-Assistant-style **Merlin** companion (the wizard-hat button by *Nodes:* in the status bar) that chats in a playful-but-precise *"wizardy"* voice, powered by a second local model (`wizard-ai`). He greets, idles, reacts while you type, thinks, and acts out a writing animation as his answer streams in — and does a trick when you click around the app.
 - **Repeater & Fuzzer** — edit and resend any captured request, with a dedicated **Body** box (and a split request/response view) so multipart/JSON bodies are easy to craft; mark `{{FUZZ}}` positions (in the request *or* body) and run wordlists with ffuf-style match/filter.
 - **High-fidelity, de-noised map** — failure states are kept distinct from real responses: transport errors (request never landed) and `5xx`/unavailable upstreams are flagged on the node (shown in the inspector), while `401`/`403`/`404` stay as legitimate attack surface. Per-locale duplicate endpoints (`…/en/…`, `…/pt/…`, `…/ar-MA/…`) collapse into one representative node so signal isn't buried in repetition.
 - **Export / import** — save a scan (all graphs + data) to JSON and reload it later for offline review.
@@ -78,14 +79,14 @@ sudo apt install -y chromium    # or install Google Chrome
 
 ## Optional: AI analysis setup
 
-The **Analyze with AI** buttons use a local Ollama model. To enable it:
+The **Analyze with AI** buttons and **The Wizard** chat use local Ollama models. To enable them:
 
 ```bash
 # Install Ollama first: curl -fsSL https://ollama.com/install.sh | sh
 ./build-reconner-ai.sh
 ```
 
-This builds the **`reconner-ai`** model from `Modelfile.reconner-ai` (tuned to run comfortably on modest hardware) and points Reconner's settings at it. You can change the model/host any time in **⚙ Settings**. If Ollama isn't running, the rest of Reconner works normally — only the AI buttons are inert.
+This builds **both** models — **`reconner-ai`** (from `Modelfile.reconner-ai`, used for node/fingerprint analysis) and **`wizard-ai`** (from `Modelfile.wizard-ai`, the conversational model behind [The Wizard](#the-wizard)) — tuned to run comfortably on modest hardware, then points Reconner's settings at them. Pass `--no-wizard` to build only `reconner-ai`. You can change either model name / the host any time in **⚙ Settings ▸ AI / Ollama**. If Ollama isn't running, the rest of Reconner works normally — only the AI features are inert.
 
 ---
 
@@ -209,12 +210,15 @@ Reconner includes a ZAP/Burp-style intercepting proxy in the **Proxy** panel (to
 
 - **Intercept: ON/OFF** — green/red toggle. When ON, each transaction is trapped for review; when OFF the proxy passes everything through transparently.
 - **▶** — forward the current item one step (a request → send it and trap its response; a response → deliver it and move to the next item).
-- **▶|** — forward the current request **without** trapping its response, advancing to the next trapped request.
 - **✕** — drop the current item (the client gets a 502 / the connection closes).
 - **Open Browser** — launch your system browser (Firefox preferred, Chromium fallback) through the proxy in a dedicated profile, with the CA trusted, so you can browse and have traffic intercepted. Opens the Target URL if one is set, otherwise a blank page.
-- **URL-encode typing** — percent-encode what you type into the request boxes.
+- **History** — open the traffic-history popup (see below).
+- **Save as Node** (top-right) — add the displayed transaction to the Site Structure graph as a node (parented under its `Referer`). Enabled only once a request has been sent and its response caught.
+- **URL-encode typing** (bottom-right) — percent-encode what you type into the request boxes.
 
 The four editor boxes (**Request Header / Request Body** over **Response Header / Response Body**, with a draggable splitter between headers and bodies) show the trapped request or response as raw HTTP. **Edit anything and forward** — both the request that gets sent and the response that gets delivered are taken from the boxes, so you can e.g. tamper a parameter on the way out or edit a response to bypass a client-side check. Every completed transaction is also added to the Site Structure tree. **Out-of-scope requests are never sent** (see Scope, above). The play/drop/Open-Browser buttons are greyed and blocked while Intercept is OFF.
+
+**Proxy History.** The **History** button opens a popup logging **every transaction the proxy relayed** (trapped or not). A list on the left — columns **# · Method · Code · Req. Size · Resp. Size · URL**, each header **click-sorts** (none → ascending → descending) — sits beside four read-only boxes showing the selected transaction's request headers/body and response headers/body. A **Search** box with ◀ / ▶ steppers walks the matches, scoped to the **main window's Scope** (so the list only shows in-scope traffic). **Right-click** a row for **Send to Repeater** / **Save as Node** (or, on empty space, **Clear All History** / **Export as JSON**); buttons at the bottom **Clear Selected**, **Clear All History**, **Export as JSON**, **Send to Repeater**, and **Save as Node**.
 
 **HTTPS trust.** For HTTPS interception your browser must trust the Reconner CA. The **Open Browser** Firefox profile is configured automatically: it imports the CA with `certutil` when available, otherwise it installs the CA into the system trust store (a one-time `pkexec`/sudo prompt) and enables Firefox's enterprise roots. For your *own* browser, use **Settings ▸ Proxy ▸ Export CA cert…** / **Install into system trust** and import/trust `~/.reconner/ca/reconner-ca.crt`. (Tip: `sudo apt install libnss3-tools` enables the no-sudo per-profile path.)
 
@@ -224,10 +228,22 @@ The four editor boxes (**Request Header / Request Body** over **Response Header 
 
 Select a node to open the **Node Inspector** panel: its URL, title, status, content type, GET/POST parameters, request & response headers and bodies, and the requests it made. The **status** is honest about *how* it was determined — a real HTTP code (e.g. `503`), `ERROR — <reason>` when the request never completed, or `NOT SENT — unsafe method` for a `POST`/`PUT`/… observed in traffic but not auto-replayed (open it in the Repeater to send it). From here:
 
+Per-node tools live in the inspector's **Options ▾** menu (also on the graph's right-click menu):
+
 - **Analyze with AI** — summarize the node's security-relevant surface (needs Ollama).
-- **Repeater** — open the raw request in an editor, tweak anything, resend it, and **Save as New Node** to add the result to the graph. The request line + headers, the **request body**, and the **response** (status/headers and body) each get their own pane, so crafting a multipart upload or JSON body is straightforward. Switch between **Input** (the request that fetched the node + its response) and **Output** (the requests the node can make) in the **I/O** view.
-- **Fuzzer** — mark `{{FUZZ}}` positions in the request **or the body**, load a wordlist, and replay with **ffuf-style match/filter** (`-mc`/`-fc`/`-ms`/`-fs`) and Cluster-bomb / Pitchfork modes. Mark a position **in the URL path** to brute-force and discover hidden endpoints, then **Save Node** the hits.
+- **Send to Repeater** — open the raw request in an editor, tweak anything, resend it, and **Save as New Node** to add the result to the graph. The request line + headers, the **request body**, and the **response** (status/headers and body) each get their own pane, so crafting a multipart upload or JSON body is straightforward. Switch between **Data In** (the request that fetched the node + its response) and **Data Out** (the requests the node can make).
+- **Send to Fuzzer** — mark `{{FUZZ}}` positions in the request **or the body**, load a wordlist, and replay with **ffuf-style match/filter** (`-mc`/`-fc`/`-ms`/`-fs`) and Cluster-bomb / Pitchfork modes. Mark a position **in the URL path** to brute-force and discover hidden endpoints, then **Save Node** the hits.
 - **Set Shell / Open Shell** — once you've landed an uploaded web shell, **Set Shell** spawns a new **shell** node as a *child* of the selected node. You give the shell file/path and the command parameter (both required — no default). The path is resolved against the selected node's URL **as a directory**: on a node `http://example.com/images`, entering `shell.jpg` yields `http://example.com/images/shell.jpg` (an absolute path like `/up/s.php` points anywhere on the host). The new node gets the black-terminal shell icon and is auto-selected. **Open Shell** then opens an interactive **Web Shell** terminal (bright-green-on-black, freely resizable): type a command, hit Enter, and Reconner sends `…/shell.jpg?<param>=<command>` and prints the raw response. A **URL Encode Commands** toggle percent-encodes the command on the wire only — you still see what you typed.
+
+---
+
+## The Wizard
+
+Click the **wizard-hat button** next to *Nodes:* in the status bar to summon **The Wizard** — an animated **Merlin** (the classic Office-Assistant character) who chats about your target in a playful *"wizardy"* voice while delivering precise pentest/AppSec guidance. He's powered by the local **`wizard-ai`** model (separate from `reconner-ai`; set under **⚙ Settings ▸ AI / Ollama ▸ Wizard Model**).
+
+Type a question and press **Enter** — his reply streams into a yellow speech balloon. The animation is fully reactive: he **greets** on open, **idles** with little gestures, starts **listening** when you type, **thinks** while the model is silent, acts out a **writing** animation while the answer streams, and plays a **farewell** when you close the window (the close waits for it to finish). Click the wizard — or anything in the app — for a **trick**.
+
+> The Merlin sprites come from the open-source [clippy.js](https://github.com/pi0/clippyjs) assets and are expected at `~/Documents/Projects/Clippy/clippy.js/agents/Merlin/`. The artwork is Microsoft's — keep it to local/personal use. A standalone previewer of all 73 animations is included: `python3 merlin_anim_test.py`.
 
 ---
 
@@ -247,7 +263,7 @@ From **Options ▾** → **Export ALL graphs (JSON)**, Reconner writes a `reconn
 
 **⚙ Settings** (stored in `~/.reconner/settings.json`), organized into tabs:
 
-- **AI / Ollama** — Ollama host (default `http://localhost:11434`), model (default `reconner-ai`), temperature, and a **Test Connection** button.
+- **AI / Ollama** — Ollama host (default `http://localhost:11434`), the analysis **model** (default `reconner-ai`), the **Wizard Model** (default `wizard-ai`, used by [The Wizard](#the-wizard)), temperature, and a **Test Connection** button.
 - **Performance** —
   - **Max concurrent browsers** (default `5`) — how many browser crawls run at once: the primary crawl plus up to N−1 concurrent subdomain crawls; the rest queue. This is the only throttle on subdomain crawling (discovery itself is unbounded). Applies live, including mid-scan.
   - **Max fingerprint workers** (default `8`) — bounded pool size for Tech Scan jobs, so unbounded subdomain discovery can't spawn unlimited HTTP/`nmap`/`whatweb` threads. Independent of the browser limit.
@@ -264,7 +280,8 @@ From **Options ▾** → **Export ALL graphs (JSON)**, Reconner writes a `reconn
 - **Nothing happens on scan / empty tree** — check the target is reachable (try the `www.` host); transient DNS/connection errors are logged in the status area.
 - **HTTPS shows `MOZILLA_PKIX_ERROR_MITM_DETECTED` / cert warnings** — the browser doesn't trust the Reconner CA. Use **Open Browser** (it sets this up), or trust `~/.reconner/ca/reconner-ca.crt` via **Settings ▸ Proxy ▸ Install into system trust**; for Firefox also enable `security.enterprise_roots.enabled`. Installing `libnss3-tools` (`certutil`) lets the launched Firefox profile trust it without sudo.
 - **Proxy didn't start / "bind failed"** — port `8080` is already in use; change it in **Settings ▸ Proxy**.
-- **AI buttons do nothing** — Ollama isn't running or the model name in Settings doesn't exist. Start Ollama and/or run `./build-reconner-ai.sh`.
+- **AI buttons / the Wizard do nothing** — Ollama isn't running or the model name in Settings doesn't exist. Start Ollama and/or run `./build-reconner-ai.sh` (builds both `reconner-ai` and `wizard-ai`).
+- **The Wizard won't appear** — the Merlin sprites are missing. They're expected at `~/Documents/Projects/Clippy/clippy.js/agents/Merlin/` (`agent.js` + `map.png`); the popup shows the exact path it looked in. Pillow (`pip install pillow`) is also required.
 - **Getting blocked (403 everywhere)** — Reconner already sends a normal (non-headless) User-Agent so the usual headless-browser fingerprint block doesn't apply. If a target still 403s every request it's a stricter WAF/Cloudflare policy — try **Stealth** mode to slow the request rate. (Tech Scan fingerprints often still succeed even when the crawl is blocked.)
 - **Auth header not on page loads** — you're on Firefox; install Chrome for CDP header injection (the request/probe path is still authenticated).
 
