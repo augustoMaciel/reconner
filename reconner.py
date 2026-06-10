@@ -8278,7 +8278,7 @@ class SettingsDialog(ModalToplevel):
         page = tk.Frame(nb, bg=C['bg'], padx=14, pady=14)
         nb.add(page, text='  About  ')
 
-        tk.Label(page, text='Reconner  v1.0.0', bg=C['bg'], fg=C['black'],
+        tk.Label(page, text='Reconner  v1.0.1', bg=C['bg'], fg=C['black'],
                  font=('MS Sans Serif', 12, 'bold')).pack(anchor='w')
         tk.Label(page, text='AI-powered bug bounty reconnaissance tool.',
                  bg=C['bg'], fg=C['black'], font=C['font']).pack(anchor='w', pady=(4, 10))

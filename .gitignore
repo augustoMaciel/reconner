@@ -54,6 +54,7 @@ exports/
 reports/
 *.log
 logs/
+*.json
 
 # Proxy / HTTPS-interception CA + per-host leaf certs
 *.pem
