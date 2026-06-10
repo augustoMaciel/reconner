@@ -185,13 +185,13 @@ C = {
     'edge':         '#999999',
     'node_page':     '#4a9eff',
     'node_file':     '#ffd700',
-    'node_redirect': '#cc0000',
+    'node_redirect': '#b71c1c',
     'node_script':   '#e67e22',
     'node_api':      '#9b59b6',
-    'node_shell':    '#00b000',
+    'node_shell':    '#2e7d32',
     'node_sel':      '#ff6b35',
-    'ok':           '#006400',
-    'err':          '#cc0000',
+    'ok':           '#2e7d32',
+    'err':          '#b71c1c',
     'font':         ('MS Sans Serif', 8),
     'font_b':       ('MS Sans Serif', 8, 'bold'),
     'mono':         ('Courier', 9),
@@ -566,7 +566,7 @@ class ToggleSwitch(tk.Canvas):
         pad, w, h = 2, self._sw, self._sh
         # Track: a sunken gray frame filled red (off) / green (on).
         self.create_rectangle(pad, pad, w - pad, h - pad,
-                              fill=('#1e8a1e' if on else '#b01818'),
+                              fill=('#2e7d32' if on else '#b71c1c'),
                               outline='#404040', width=1)
         self.create_line(pad, pad, w - pad, pad, fill='#000000')
         self.create_line(pad, pad, pad, h - pad, fill='#000000')
@@ -657,7 +657,7 @@ class EditText95(tk.Text):
 class Chicago95Progress(tk.Frame):
     """Classic Win9x-style marquee: a cluster of green blocks sliding across a
     sunken white box. Animation only — start()/stop()/reset()."""
-    GREEN = '#008000'
+    GREEN = '#2e7d32'
 
     def __init__(self, parent, width=150, height=16, **kw):
         """Build the sunken canvas and the marquee block geometry."""
@@ -709,8 +709,8 @@ class Chicago95Progress(tk.Frame):
 
 class StatusBox(tk.Frame):
     """Small square box that shows a green check (success) or red X (failure)."""
-    GREEN = '#008000'
-    RED   = '#cc0000'
+    GREEN = '#2e7d32'
+    RED   = '#b71c1c'
 
     def __init__(self, parent, size=18, **kw):
         """Build the small sunken canvas the check/X is drawn on."""
@@ -6485,7 +6485,7 @@ def _icon_redirect_window(ax, x, y, s, face, z):
     cl, cb, cw, ch = _win95_window(ax, x, y, s, face, z)
     if ch <= 0:
         return
-    RED = '#cc0000'
+    RED = '#b71c1c'
     ay = cb + ch * 0.5
     xl, xr = cl + cw * 0.14, cl + cw * 0.86
     head_w, head_h = cw * 0.26, ch * 0.62
@@ -6511,6 +6511,8 @@ def _icon_shell(ax, x, y, s, face, z):
     cl, cb, cw, ch = _win95_window(ax, x, y, s, face, z)
     if ch <= 0:
         return
+    # Bright terminal green-on-black (exempt from the app-wide green
+    # unification) so the icon's prompt reads like the real Web Shell terminal.
     GREEN = '#00ff00'
     CYAN  = '#00ffff'
     # Black terminal screen filling the client area.
@@ -7040,16 +7042,19 @@ class GraphPanel(tk.Frame):
         bot.pack(fill='x', padx=4, pady=(0, 3))
         tk.Label(bot, text='Search:', bg=C['bg'],
                  font=C['font']).pack(side='left', padx=(0, 2))
+        # Pack the ◀ / ▶ steppers first (anchored right at their natural, equal
+        # size) so the search Entry simply fills whatever space is left — that
+        # way neither arrow is ever squeezed or clipped by the panel border.
+        Btn(bot, text='▶', padx=4,
+            command=self._search_next).pack(side='right', padx=(1, 2))
+        Btn(bot, text='◀', padx=4,
+            command=self._search_prev).pack(side='right', padx=(6, 1))
         self._search_var = tk.StringVar(value='')
         se = tk.Entry(bot, textvariable=self._search_var, font=C['font'],
                       relief='sunken', bd=2, bg=C['window'], highlightthickness=0)
         se.bind('<KeyRelease>', self._on_search)
         se.pack(side='left', fill='x', expand=True)
         self._search_ent = se
-        Btn(bot, text='◀', padx=4,
-            command=self._search_prev).pack(side='left', padx=(6, 1))
-        Btn(bot, text='▶', padx=4,
-            command=self._search_next).pack(side='left', padx=(1, 2))
 
     # ── tree helpers ──────────────────────────────────────────────────
     def _iter_iids(self, parent=''):
@@ -7643,8 +7648,8 @@ class InfoPanel(tk.Frame):
         menu.add_command(label='Analyze with AI', command=self._ai_analyze)
         menu.add_command(label='Open in Browser', command=self._open_in_browser)
         menu.add_separator()
-        menu.add_command(label='Repeater', command=self._open_repeater)
-        menu.add_command(label='Fuzzer', command=self._open_fuzzer)
+        menu.add_command(label='Send to Repeater', command=self._open_repeater)
+        menu.add_command(label='Send to Fuzzer', command=self._open_fuzzer)
         menu.add_separator()
         menu.add_command(label='Set Shell', command=self._set_shell)
         # 'Open Shell' stays disabled (greyed) until a shell-type node is
@@ -7706,25 +7711,6 @@ class InfoPanel(tk.Frame):
         nb.add(t1, text='Content')
         cf, self.content_txt = self._scrolled_text(t1)
         cf.pack(fill='both', expand=True, padx=2, pady=2)
-
-        # Tab: I/O  — data entering the node (GET/POST used to fetch it) on the
-        # left, every sendable parameter the node exposes on the right
-        t2 = tk.Frame(nb, bg=C['bg'])
-        nb.add(t2, text='I/O')
-
-        in_col = tk.Frame(t2, bg=C['bg'])
-        in_col.pack(side='left', fill='both', expand=True, padx=(4, 2), pady=2)
-        tk.Label(in_col, text='Input  (GET / POST used to fetch this node):',
-                 bg=C['bg'], font=C['font_b']).pack(anchor='w')
-        gf, self.in_txt = self._scrolled_text(in_col)
-        gf.pack(fill='both', expand=True, pady=(2, 0))
-
-        out_col = tk.Frame(t2, bg=C['bg'])
-        out_col.pack(side='left', fill='both', expand=True, padx=(2, 4), pady=2)
-        tk.Label(out_col, text='Output  (sendable params: forms + link params):',
-                 bg=C['bg'], font=C['font_b']).pack(anchor='w')
-        ff, self.out_txt = self._scrolled_text(out_col)
-        ff.pack(fill='both', expand=True, pady=(2, 0))
 
         # Tab: Req / Resp  — request on the left, response on the right
         t4 = tk.Frame(nb, bg=C['bg'])
@@ -7795,14 +7781,6 @@ class InfoPanel(tk.Frame):
                     f'[Swap the locale path segment to reach a specific one.]\n\n'
                     + body)
         self.content_txt.set_content(body)
-        din = compute_data_in(node)
-        self.in_txt.set_content(
-            json.dumps(din, indent=2) if (din['GET'] or din['POST'])
-            else 'No inbound data (no GET/POST params used to fetch this node).')
-        dout = compute_data_out(node)
-        self.out_txt.set_content(
-            json.dumps(dout, indent=2) if dout
-            else 'No outbound data (no forms or parameterized links to send).')
         self.req_txt.set_content(self._fmt_request(node))
         self.resp_txt.set_content(self._fmt_response(node))
         if node.ai_insight:
@@ -7820,7 +7798,6 @@ class InfoPanel(tk.Frame):
             self.ov_vars[k].set('')
         self.links_lb.delete(0, 'end')
         for txt, msg in ((self.content_txt, 'No node selected.'),
-                         (self.in_txt, ''), (self.out_txt, ''),
                          (self.req_txt, ''), (self.resp_txt, ''),
                          (self.ai_txt, 'Select a node and click "Analyze with AI".')):
             txt.set_content(msg)
@@ -8637,7 +8614,7 @@ class RequestEditorDialog(ModalToplevel):
         bar = tk.Frame(self.in_frame, bg=C['bg'])
         bar.pack(fill='x', pady=(6, 0))
         self.send_btn = Btn(bar, text='  Send  ', command=self._send,
-                            bg='#006400', fg='white')
+                            bg='#2e7d32', fg='white')
         self.send_btn.pack(side='left')
         Btn(bar, text='Reset to original',
             command=self._reset).pack(side='left', padx=6)
@@ -8683,7 +8660,7 @@ class RequestEditorDialog(ModalToplevel):
         dobar = tk.Frame(ea, bg=C['bg'])
         dobar.pack(side='bottom', fill='x', pady=(4, 0))
         self.do_send_btn = Btn(dobar, text='  Send  ', command=self._do_send,
-                               bg='#006400', fg='white')
+                               bg='#2e7d32', fg='white')
         self.do_send_btn.pack(side='left')
         Btn(dobar, text='Reset to original',
             command=self._do_reset).pack(side='left', padx=6)
@@ -9078,10 +9055,10 @@ class FuzzerDialog(ModalToplevel):
         bar = tk.Frame(wrap, bg=C['bg'])
         bar.pack(fill='x', pady=(0, 6))
         self.start_btn = Btn(bar, text='  Start  ', command=self._start,
-                             bg='#006400', fg='white')
+                             bg='#2e7d32', fg='white')
         self.start_btn.pack(side='left')
         self.stop_btn = Btn(bar, text=' Stop ', command=self._stop,
-                            bg='#8b0000', fg='white', state='disabled')
+                            bg='#b71c1c', fg='white', state='disabled')
         self.stop_btn.pack(side='left', padx=4)
         # Save the currently-selected result as a node in the graph.
         self.save_btn = Btn(bar, text='Save Node', command=self._save_selected,
@@ -9573,7 +9550,7 @@ class AuthDialog(ModalToplevel):
         bar = tk.Frame(wrap, bg=C['bg'])
         bar.pack(fill='x', pady=(6, 0))
         Btn(bar, text=' Apply & retry ', command=self._apply,
-            bg='#006400', fg='white').pack(side='left')
+            bg='#2e7d32', fg='white').pack(side='left')
         Btn(bar, text=' Skip host ',
             command=lambda: self._finish(None)).pack(side='left', padx=4)
         Btn(bar, text=' Continue unauthenticated ',
@@ -9711,6 +9688,46 @@ class helper:
         notebook, frames, labels and buttons."""
         style = ttk.Style(root)
         style.theme_use('default')
+        # Solid-black tree disclosure triangles. The 'default' theme draws only a
+        # thin hollow outline (its indicator 'foreground' won't fill it), so
+        # replace the indicator element with filled triangle images: ▶ closed,
+        # ▼ open, and a blank for leaves. Images are stashed on `root` so Tk
+        # doesn't garbage-collect them. Only the Site Structure tree (show='tree')
+        # has indicators — header-only trees are unaffected.
+        try:
+            def _tri(direction, n=9):
+                """An n×n PhotoImage of a solid black triangle (transparent bg)."""
+                img = tk.PhotoImage(width=n, height=n)
+                c = (n - 1) / 2
+                for y in range(n):
+                    for x in range(n):
+                        inside = (x <= (n - 1) - 2 * abs(y - c)
+                                  if direction == 'right'
+                                  else y <= (n - 1) - 2 * abs(x - c))
+                        if inside:
+                            img.put('#000000', (x, y))
+                        else:
+                            img.transparency_set(x, y, True)
+                return img
+            blank = tk.PhotoImage(width=9, height=9)
+            for _y in range(9):
+                for _x in range(9):
+                    blank.transparency_set(_x, _y, True)
+            closed, opened = _tri('right'), _tri('down')
+            root._tree_indicator_imgs = (closed, opened, blank)
+            style.element_create('Treeitem.blackindicator', 'image', closed,
+                                 ('user1', '!user2', opened),
+                                 ('user2', blank),
+                                 sticky='w', width=15)
+            style.layout('Treeview.Item', [
+                ('Treeitem.padding', {'sticky': 'nswe', 'children': [
+                    ('Treeitem.blackindicator', {'side': 'left', 'sticky': ''}),
+                    ('Treeitem.image', {'side': 'left', 'sticky': ''}),
+                    ('Treeitem.text', {'sticky': 'nswe'}),
+                ]}),
+            ])
+        except Exception:
+            pass
         style.configure('TFrame', background=C['bg'])
         style.configure('TLabel', background=C['bg'], foreground=C['black'], font=C['font'])
         style.configure('TButton', background=C['btn'], foreground=C['black'],
@@ -10338,6 +10355,9 @@ class WebShellDialog(tk.Toplevel):
 
         wrap = tk.Frame(self, bg='#000000')
         wrap.pack(fill='both', expand=True)
+        # The web-shell terminal keeps its own classic green-on-black palette
+        # (exempt from the app-wide green/red unification): bright green text,
+        # dimmer green echoes, bright-red errors.
         self.txt = tk.Text(wrap, bg='#000000', fg='#00ff00',
                            insertbackground='#00ff00',
                            font=('Courier', 11, 'bold'),
@@ -11372,6 +11392,445 @@ class InterceptProxy:
             self.ui_call(lambda: self.on_node(flow))
 
 
+class ProxyHistoryDialog(tk.Toplevel):
+    """A non-modal history viewer for the intercepting proxy: every transaction
+    the proxy has relayed, listed on the left, with the selected one's request /
+    response split across four read-only boxes on the right (request headers over
+    request body on the left column, response headers over response body on the
+    right).
+
+    A top bar carries a Scope filter (a glob like '*.example.com' that restricts
+    which transactions are listed) and a Search box with ◀ / ▶ steppers that walks
+    the matches *within the in-scope rows*. The list columns (#, Method, Code, URL,
+    Req size, Resp size) sort on a header click, cycling none → ascending →
+    descending → none. Buttons clear the selected row, clear all history, or export
+    the whole history as JSON. Stays open while the proxy keeps capturing — the
+    panel pushes new rows in live via `add_row`."""
+
+    # Column id → (heading title, width, numeric?, stretch?). Widths are sized to
+    # fit the title plus the sort arrow (' ▲' / ' ▼') the heading grows by when
+    # the column is ordered, so the label never clips.
+    _COLS = (('id', '#', 54, True, False),
+             ('method', 'Method', 90, False, False),
+             ('status', 'Code', 70, True, False),
+             ('req_size', 'Req. Size', 100, True, False),
+             ('resp_size', 'Resp. Size', 104, True, False),
+             ('url', 'URL', 300, False, True))
+
+    def __init__(self, parent, panel):
+        """Build the viewer over `panel`'s history list and populate it."""
+        super().__init__(parent, bg=C['bg'])
+        self.panel = panel
+        self.title('Proxy History')
+        self.configure(bg=C['bg'])
+        self.geometry('1080x600')
+        self._sort_col = None           # column id currently sorted, or None
+        self._sort_dir = 0              # 1 ascending, -1 descending, 0 none
+        self._visible_ids = []          # ids shown, in display order
+        self._search_matches = []       # ids matching the search, in order
+        self._search_idx = -1
+        self._search_query = ''
+        self._build()
+        self._rebuild_list()
+        # Drop the panel's reference when closed so live updates stop.
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    def _build(self):
+        """The top search bar, the list ▸ four-box split, action buttons. The list
+        is scoped by the main window's scope field (no separate scope box here)."""
+        # ── top: search with steppers (steppers first, at equal natural size) ──
+        top = tk.Frame(self, bg=C['bg'])
+        top.pack(fill='x', padx=6, pady=(6, 0))
+        tk.Label(top, text='Search:', bg=C['bg'],
+                 font=C['font']).pack(side='left', padx=(0, 2))
+        Btn(top, text='▶', padx=4,
+            command=self._search_next).pack(side='right', padx=(1, 0))
+        Btn(top, text='◀', padx=4,
+            command=self._search_prev).pack(side='right', padx=(6, 1))
+        self._search_var = tk.StringVar(value='')
+        se = tk.Entry(top, textvariable=self._search_var, font=C['font'],
+                      relief='sunken', bd=2, bg=C['window'], highlightthickness=0)
+        se.bind('<KeyRelease>', self._on_search)
+        se.pack(side='left', fill='x', expand=True, padx=(2, 0))
+        self._search_ent = se
+
+        body = tk.Frame(self, bg=C['bg'])
+        body.pack(fill='both', expand=True, padx=6, pady=4)
+
+        # ── left: the traffic list ──
+        left = tk.Frame(body, bg=C['bg'])
+        left.pack(side='left', fill='both', expand=False)
+        tk.Label(left, text='Intercepted traffic', bg=C['bg'],
+                 font=C['font_b']).pack(anchor='w')
+        lwrap = tk.Frame(left, bg=C['bg'])
+        lwrap.pack(fill='both', expand=True, pady=(2, 0))
+        cols = tuple(c[0] for c in self._COLS)
+        self.tree = ttk.Treeview(lwrap, columns=cols, show='headings',
+                                 selectmode='browse', height=20)
+        for cid, txt, w, _num, stretch in self._COLS:
+            self.tree.heading(cid, text=txt,
+                              command=lambda c=cid: self._on_sort(c))
+            # minwidth = width keeps fixed columns from shrinking below the
+            # heading (title + arrow); URL keeps a sensible floor while it grows.
+            self.tree.column(cid, width=w, anchor='w', stretch=stretch,
+                             minwidth=(120 if stretch else w))
+        sb = tk.Scrollbar(lwrap, orient='vertical', command=self.tree.yview)
+        self.tree.config(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self.tree.bind('<<TreeviewSelect>>', self._on_select)
+        self.tree.bind('<Button-3>', self._on_right_click)
+        self._ctx_menu = None
+
+        # ── right: the four read-only boxes (headers over bodies) ──
+        right = tk.Frame(body, bg=C['bg'])
+        right.pack(side='left', fill='both', expand=True, padx=(6, 0))
+
+        def cell(row, col, label):
+            """A labelled read-only box at (row, col) of the 2×2 grid."""
+            cf = tk.Frame(right, bg=C['bg'])
+            cf.grid(row=row, column=col, sticky='nsew',
+                    padx=(0, 3) if col == 0 else (3, 0),
+                    pady=(0, 3) if row == 0 else (3, 0))
+            cf.rowconfigure(1, weight=1)
+            cf.columnconfigure(0, weight=1)
+            tk.Label(cf, text=label, bg=C['bg'],
+                     font=C['font_b']).grid(row=0, column=0, sticky='w')
+            wrap = tk.Frame(cf, bg=C['bg'])
+            wrap.grid(row=1, column=0, sticky='nsew', pady=(2, 0))
+            txt = Text95(wrap, height=8, width=40)
+            s = tk.Scrollbar(wrap, orient='vertical', command=txt.yview)
+            txt.config(yscrollcommand=s.set)
+            txt.pack(side='left', fill='both', expand=True)
+            s.pack(side='right', fill='y')
+            return txt
+
+        right.rowconfigure(0, weight=1, uniform='hb')
+        right.rowconfigure(1, weight=1, uniform='hb')
+        right.columnconfigure(0, weight=1, uniform='rr')
+        right.columnconfigure(1, weight=1, uniform='rr')
+        self.req_head_txt = cell(0, 0, 'Request Headers')
+        self.req_body_txt = cell(1, 0, 'Request Body')
+        self.resp_head_txt = cell(0, 1, 'Response Headers')
+        self.resp_body_txt = cell(1, 1, 'Response Body')
+
+        # ── bottom: actions (clear/export on the left; repeater + save node on
+        # the bottom-right, Send to Repeater immediately left of Save as Node) ──
+        btns = tk.Frame(self, bg=C['bg'])
+        btns.pack(fill='x', padx=6, pady=(0, 6))
+        Btn(btns, text=' Clear Selected ',
+            command=self._clear_selected).pack(side='left', padx=(0, 4))
+        Btn(btns, text=' Clear All History ',
+            command=self._clear_all).pack(side='left', padx=4)
+        Btn(btns, text=' Export as JSON ',
+            command=self._export_json).pack(side='left', padx=4)
+        Btn(btns, text=' Save as Node ',
+            command=self._save_selected_node).pack(side='right', padx=(4, 0))
+        Btn(btns, text=' Send to Repeater ',
+            command=self._repeat_selected).pack(side='right', padx=4)
+
+    # ── scope / sort / list maintenance ──
+    def _in_scope(self, url):
+        """Whether `url` passes the main window's scope (shared via the proxy
+        controller). True when there is no controller or no scope set."""
+        ctrl = getattr(self.panel, 'controller', None)
+        if ctrl is None:
+            return True
+        try:
+            return ctrl.in_scope(url)
+        except Exception:
+            return True
+
+    def _scoped_records(self):
+        """The history records that pass the main window's scope (history order)."""
+        return [r for r in self.panel.history if self._in_scope(r['url'])]
+
+    def _sorted_records(self):
+        """Scoped records with the current column sort applied (none = history
+        order)."""
+        recs = self._scoped_records()
+        if not self._sort_col or self._sort_dir == 0:
+            return recs
+        numeric = next((c[3] for c in self._COLS if c[0] == self._sort_col),
+                       False)
+        col = self._sort_col
+
+        def key(r):
+            v = r.get(col)
+            if numeric:
+                try:
+                    return (0, float(v))
+                except (TypeError, ValueError):
+                    return (1, 0.0)        # missing/None sorts last
+            return (0, str(v or '').lower())
+        return sorted(recs, key=key, reverse=(self._sort_dir < 0))
+
+    def _rebuild_list(self):
+        """Repopulate the tree from scope + sort, refresh headings + search."""
+        self.tree.delete(*self.tree.get_children())
+        self._visible_ids = []
+        for rec in self._sorted_records():
+            self._insert(rec)
+            self._visible_ids.append(str(rec['id']))
+        self._refresh_headings()
+        self._refresh_search(step=False)
+
+    def _refresh_headings(self):
+        """Repaint the heading titles with the active sort arrow (▲ / ▼)."""
+        for cid, txt, _w, _num, _stretch in self._COLS:
+            arrow = ''
+            if cid == self._sort_col and self._sort_dir:
+                arrow = ' ▲' if self._sort_dir > 0 else ' ▼'
+            self.tree.heading(cid, text=txt + arrow)
+
+    def _on_sort(self, col):
+        """Cycle this column's sort: none → ascending → descending → none."""
+        if col == self._sort_col:
+            self._sort_dir = {0: 1, 1: -1, -1: 0}[self._sort_dir]
+            if self._sort_dir == 0:
+                self._sort_col = None
+        else:
+            self._sort_col = col
+            self._sort_dir = 1
+        self._rebuild_list()
+
+    def _insert(self, rec):
+        """Append one history record as a tree row (iid = the record's id)."""
+        self.tree.insert('', 'end', iid=str(rec['id']),
+                         values=(rec['id'], rec['method'],
+                                 rec.get('status') or '',
+                                 rec.get('req_size', 0),
+                                 rec.get('resp_size', 0),
+                                 rec['url'][:300]))
+
+    def add_row(self, _rec):
+        """Live hook: the panel just recorded a new flow — re-apply scope/sort so
+        the new row lands in the right place (and only if it is in scope)."""
+        try:
+            self._rebuild_list()
+        except tk.TclError:
+            pass
+
+    def _on_select(self, _evt=None):
+        """Show the request/response of the selected row in the four boxes."""
+        rec = self._selected_record()
+        self._show(rec)
+
+    def _selected_record(self):
+        """The history record for the selected row, or None."""
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return next((r for r in self.panel.history
+                     if str(r['id']) == sel[0]), None)
+
+    @staticmethod
+    def _node_from_record(rec):
+        """Build a SiteNode from a history record (same builder the panel uses)."""
+        return ProxyPanel.build_node(
+            rec['method'], rec['url'], rec.get('req_headers', {}),
+            rec.get('req_body', ''), rec.get('status'), rec.get('reason', ''),
+            rec.get('resp_headers', {}), rec.get('resp_body', ''))
+
+    def _save_selected_node(self):
+        """Save the selected transaction to the graph as a node."""
+        rec = self._selected_record()
+        if rec is None or not self.panel.on_save_node:
+            return
+        self.panel.on_save_node(self._node_from_record(rec))
+
+    def _repeat_selected(self):
+        """Open the Repeater seeded with the selected transaction."""
+        rec = self._selected_record()
+        if rec is None or not self.panel.on_repeat_node:
+            return
+        self.panel.on_repeat_node(self._node_from_record(rec))
+
+    # ── right-click context menu (mirrors the Site Structure tree) ──
+    def _on_right_click(self, ev):
+        """Post a context menu. Over a row: the per-row actions. Over the empty
+        area inside the list (no row): only the list-wide actions (Clear All
+        History + Export as JSON). The menu auto-closes when the cursor leaves it
+        (a short timer, cancelled on re-entry) — same as the Site Structure tree."""
+        m = tk.Menu(self, tearoff=0, bg=C['btn'], fg=C['black'],
+                    activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
+                    font=C['font'])
+        iid = self.tree.identify_row(ev.y)
+        if iid:
+            self.tree.selection_set(iid)
+            self._on_select()
+            m.add_command(label='Send to Repeater', command=self._repeat_selected)
+            m.add_command(label='Save as Node', command=self._save_selected_node)
+            m.add_separator()
+            m.add_command(label='Clear Selected', command=self._clear_selected)
+            m.add_command(label='Clear All History', command=self._clear_all)
+            m.add_command(label='Export as JSON', command=self._export_json)
+        else:
+            m.add_command(label='Clear All History', command=self._clear_all)
+            m.add_command(label='Export as JSON', command=self._export_json)
+        m.bind('<Enter>', lambda _e: self._cancel_menu_dismiss(), add='+')
+        m.bind('<Leave>', lambda _e: self._schedule_menu_dismiss(), add='+')
+        self._ctx_menu = m
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
+
+    def _schedule_menu_dismiss(self):
+        """Arm the deferred close of the open context menu (cursor left it)."""
+        self._cancel_menu_dismiss()
+        if self._ctx_menu is None:
+            return
+        self._menu_dismiss_after = self.after(140, self._do_ctx_dismiss)
+
+    def _cancel_menu_dismiss(self):
+        """Cancel a pending context-menu dismiss (cursor re-entered the menu)."""
+        if getattr(self, '_menu_dismiss_after', None) is not None:
+            try:
+                self.after_cancel(self._menu_dismiss_after)
+            except Exception:
+                pass
+            self._menu_dismiss_after = None
+
+    def _do_ctx_dismiss(self):
+        """Close the context menu — the timer fired without re-entry."""
+        self._menu_dismiss_after = None
+        m, self._ctx_menu = self._ctx_menu, None
+        if m is None:
+            return
+        try:
+            m.unpost()
+        except tk.TclError:
+            pass
+        try:
+            m.grab_release()
+        except tk.TclError:
+            pass
+
+    # ── search ──
+    def _build_search_matches(self, query):
+        """Ids of the in-scope (visible) rows whose #/method/code/URL contain
+        `query` (case-insensitive). Empty query → no matches."""
+        q = (query or '').strip().lower()
+        if not q:
+            return []
+        by_id = {str(r['id']): r for r in self.panel.history}
+        out = []
+        for rid in self._visible_ids:
+            r = by_id.get(rid)
+            if not r:
+                continue
+            hay = ' '.join(str(x) for x in (
+                r['id'], r['method'], r.get('status') or '', r['url'])).lower()
+            if q in hay:
+                out.append(rid)
+        return out
+
+    def _on_search(self, *_):
+        """Recompute matches for the current query and jump to the first."""
+        self._refresh_search(step=True)
+
+    def _refresh_search(self, step):
+        """Rebuild the match set against the visible rows; optionally step to the
+        first match. Tints the search box pink when a non-empty query misses."""
+        query = self._search_var.get()
+        self._search_query = query
+        self._search_matches = self._build_search_matches(query)
+        self._search_idx = -1
+        try:
+            self._search_ent.config(
+                bg=(C['window'] if (self._search_matches or not query.strip())
+                    else '#ffd6d6'))
+        except tk.TclError:
+            pass
+        if step and self._search_matches:
+            self._search_step(0)
+
+    def _search_step(self, delta):
+        """Move the search cursor by `delta` (wrapping) and select+reveal it."""
+        if not self._search_matches:
+            return
+        n = len(self._search_matches)
+        self._search_idx = (self._search_idx + delta) % n \
+            if self._search_idx >= 0 else 0
+        rid = self._search_matches[self._search_idx]
+        try:
+            self.tree.selection_set(rid)
+            self.tree.focus(rid)
+            self.tree.see(rid)
+        except tk.TclError:
+            pass
+
+    def _search_next(self, *_):
+        """▶ — select the next match (wraps to the first)."""
+        self._search_step(1)
+
+    def _search_prev(self, *_):
+        """◀ — select the previous match (wraps to the last)."""
+        self._search_step(-1)
+
+    def _show(self, rec):
+        """Paint (or clear) the four boxes for history record `rec`."""
+        self.req_head_txt.set_content(rec['req_head'] if rec else '')
+        self.req_body_txt.set_content(rec['req_body'] if rec else '')
+        self.resp_head_txt.set_content(rec['resp_head'] if rec else '')
+        self.resp_body_txt.set_content(rec['resp_body'] if rec else '')
+
+    # ── actions ──
+    def _clear_selected(self):
+        """Drop the selected transaction from the history and the list."""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        rid = sel[0]
+        self.panel.history[:] = [r for r in self.panel.history
+                                 if str(r['id']) != rid]
+        self._rebuild_list()
+        self._show(None)
+
+    def _clear_all(self):
+        """Wipe the entire proxy history (after confirmation)."""
+        if not self.panel.history:
+            return
+        if not messagebox.askyesno(
+                'Clear All History',
+                'Delete all intercepted traffic from the history?',
+                parent=self):
+            return
+        self.panel.history.clear()
+        self._rebuild_list()
+        self._show(None)
+
+    def _export_json(self):
+        """Write the whole history to a JSON file chosen by the user."""
+        if not self.panel.history:
+            messagebox.showinfo('Export History', 'History is empty.',
+                                parent=self)
+            return
+        fn = filedialog.asksaveasfilename(
+            parent=self, title='Export proxy history',
+            defaultextension='.json',
+            filetypes=[('JSON', '*.json'), ('All files', '*.*')])
+        if not fn:
+            return
+        try:
+            with open(fn, 'w', encoding='utf-8') as fh:
+                json.dump(self.panel.history, fh, indent=2, ensure_ascii=False)
+            messagebox.showinfo(
+                'Export History',
+                f'Exported {len(self.panel.history)} transactions.',
+                parent=self)
+        except Exception as e:
+            messagebox.showerror('Export History', f'Export failed:\n{e}',
+                                 parent=self)
+
+    def _on_close(self):
+        """Detach from the panel (stop live updates) and close."""
+        if getattr(self.panel, '_history_win', None) is self:
+            self.panel._history_win = None
+        self.destroy()
+
+
 class ProxyPanel(tk.Frame):
     """The intercepting-proxy panel (repeater-style). An intercept toolbar over
     four editable boxes (request line+headers / request body / response
@@ -11382,14 +11841,21 @@ class ProxyPanel(tk.Frame):
     button toggles trapping; Open Browser launches the system browser through the
     proxy."""
 
-    def __init__(self, parent, controller=None, on_open_browser=None, **kw):
+    def __init__(self, parent, controller=None, on_open_browser=None,
+                 on_save_node=None, on_repeat_node=None, **kw):
         """Build the panel; `controller` is the InterceptProxy (may be set later
-        via set_controller), `on_open_browser` opens the system browser."""
+        via set_controller), `on_open_browser` opens the system browser,
+        `on_save_node(node)` adds a SiteNode to the graph, and
+        `on_repeat_node(node)` opens the Repeater seeded with one."""
         super().__init__(parent, bg=C['bg'], relief='ridge', bd=2, **kw)
         self.controller = controller
         self.on_open_browser = on_open_browser
+        self.on_save_node = on_save_node
+        self.on_repeat_node = on_repeat_node
         self._current = None            # the ProxyFlow being shown, or None
         self.encode_var = tk.BooleanVar(value=False)
+        self.history = []               # every relayed transaction (records)
+        self._history_win = None        # the open ProxyHistoryDialog, if any
         self._build()
 
     def set_controller(self, controller):
@@ -11409,23 +11875,24 @@ class ProxyPanel(tk.Frame):
                                  command=self._toggle_intercept,
                                  bg='#b71c1c', fg='white')
         self.intercept_btn.pack(side='left', padx=(0, 6))
-        # ▶ forward one step · ▶| forward request without trapping its response.
-        # Grey button, black icons; greyed/blocked when the proxy isn't running.
+        # ▶ forward one step. Grey button, black icon; greyed/blocked when the
+        # proxy isn't running.
         self.fwd_btn = Btn(bar, text=' ▶ ', command=self._forward,
                            bg=C['btn'], fg=C['black'], state='disabled')
         self.fwd_btn.pack(side='left', padx=2)
-        self.fwd_cont_btn = Btn(bar, text=' ▶| ', command=self._forward_continue,
-                                bg=C['btn'], fg=C['black'], state='disabled')
-        self.fwd_cont_btn.pack(side='left', padx=2)
         # Drop keeps its red colour even when blocked (only its state changes).
         self.drop_btn = Btn(bar, text=' ✕ ', command=self._drop,
-                            bg='#8b0000', fg='white', state='disabled')
+                            bg='#b71c1c', fg='white', state='disabled')
         self.drop_btn.pack(side='left', padx=2)
         self.open_btn = Btn(bar, text=' Open Browser ', command=self._open_browser)
         self.open_btn.pack(side='left', padx=(10, 2))
-        tk.Checkbutton(bar, text='URL-encode typing', variable=self.encode_var,
-                       bg=C['bg'], activebackground=C['bg'], selectcolor=C['window'],
-                       highlightthickness=0, font=C['font']).pack(side='right')
+        self.history_btn = Btn(bar, text=' History ', command=self._open_history)
+        self.history_btn.pack(side='left', padx=2)
+        # Top-right: save the displayed transaction as a graph node. Only usable
+        # once the request has been sent and its response caught (response phase).
+        self.save_node_btn = Btn(bar, text=' Save as Node ',
+                                 command=self._save_as_node, state='disabled')
+        self.save_node_btn.pack(side='right', padx=2)
 
         cont, self.req_txt, self.body_txt, self.resp_txt, self.resp_body_txt = \
             _build_req_resp_fixed(self, req_label='Request Header',
@@ -11433,7 +11900,14 @@ class ProxyPanel(tk.Frame):
                                   resp_label='Response Header',
                                   resp_body_label='Response Body',
                                   req_editable=True, resp_editable=True)
-        cont.pack(fill='both', expand=True, padx=6, pady=(2, 6))
+        # Bottom bar (URL-encode typing pinned to the bottom-right), packed before
+        # the editor so it stays anchored to the bottom edge.
+        botbar = tk.Frame(self, bg=C['bg'])
+        botbar.pack(side='bottom', fill='x', padx=6, pady=(0, 4))
+        tk.Checkbutton(botbar, text='URL-encode typing', variable=self.encode_var,
+                       bg=C['bg'], activebackground=C['bg'], selectcolor=C['window'],
+                       highlightthickness=0, font=C['font']).pack(side='right')
+        cont.pack(fill='both', expand=True, padx=6, pady=(2, 4))
         _bind_urlencode(self.req_txt, self.encode_var.get)
         _bind_urlencode(self.body_txt, self.encode_var.get)
         self._show_empty()
@@ -11492,12 +11966,13 @@ class ProxyPanel(tk.Frame):
         trapped flow; Open Browser just needs intercept on."""
         on = bool(self.controller and self.controller.intercept)
         have = self._current is not None
-        is_req = have and self._current.phase == 'request'
+        caught = have and self._current.status is not None
         self.fwd_btn.config(state=('normal' if on and have else 'disabled'))
         self.drop_btn.config(state=('normal' if on and have else 'disabled'))
-        self.fwd_cont_btn.config(
-            state=('normal' if on and is_req else 'disabled'))
         self.open_btn.config(state=('normal' if on else 'disabled'))
+        # Save as Node needs a sent request with a caught response — independent
+        # of the intercept toggle.
+        self.save_node_btn.config(state=('normal' if caught else 'disabled'))
 
     # ── actions ──
     def _edited_head_body(self):
@@ -11516,14 +11991,6 @@ class ProxyPanel(tk.Frame):
         head, body = self._edited_head_body()
         self.controller.resolve('forward', head, body)
 
-    def _forward_continue(self):
-        """Forward the current request without trapping its response, advancing to
-        the next trapped request."""
-        if not (self.controller and self._current):
-            return
-        head, body = self._edited_head_body()
-        self.controller.resolve('forward_continue', head, body)
-
     def _drop(self):
         """Drop the current flow (the client gets a 502 / the connection closes)."""
         if not (self.controller and self._current):
@@ -11534,6 +12001,117 @@ class ProxyPanel(tk.Frame):
         """Launch the system browser through the proxy (delegates to the app)."""
         if self.on_open_browser:
             self.on_open_browser()
+
+    # ── save as node (shared with the History popup) ──
+    @staticmethod
+    def _classify_node_type(url, status, content_type):
+        """Pick a tree node type from the response (mirrors the auto-capture
+        classifier)."""
+        ct = (content_type or '').lower()
+        path = (urlparse(url).path or '').lower()
+        if status and 300 <= status < 400:
+            return 'redirect'
+        if 'javascript' in ct or path.endswith('.js'):
+            return 'script'
+        if 'html' in ct:
+            return 'page'
+        if any(path.endswith(e) for e in ('.css', '.png', '.jpg', '.jpeg', '.gif',
+                                          '.svg', '.ico', '.woff', '.woff2', '.ttf')):
+            return 'file'
+        if 'json' in ct or 'xml' in ct:
+            return 'endpoint'
+        return 'page'
+
+    @staticmethod
+    def _referer_parent(req_headers, self_url):
+        """The Referer URL to use as the node's parent (so it nests under the page
+        that triggered it), or None when absent / self-referential."""
+        for k, v in (req_headers or {}).items():
+            if k.lower() == 'referer' and v and v != self_url:
+                return v
+        return None
+
+    @classmethod
+    def build_node(cls, method, url, req_headers, req_body, status, reason,
+                   resp_headers, resp_body):
+        """Build a user-created (edited=True) SiteNode from a captured request /
+        response, parented to its Referer. Shared by the panel button and the
+        History popup so both produce identical nodes."""
+        req_headers = dict(req_headers or {})
+        resp_headers = dict(resp_headers or {})
+        ct = resp_headers.get('Content-Type', '') or next(
+            (v for k, v in resp_headers.items() if k.lower() == 'content-type'),
+            '')
+        node = SiteNode(url=url,
+                        node_type=cls._classify_node_type(url, status, ct),
+                        parent_url=cls._referer_parent(req_headers, url))
+        body = req_body.decode('utf-8', 'replace') \
+            if isinstance(req_body, bytes) else (req_body or '')
+        rbody = resp_body.decode('utf-8', 'replace') \
+            if isinstance(resp_body, bytes) else (resp_body or '')
+        node.req_method = method
+        node.req_url = url
+        node.req_headers = req_headers
+        node.req_body = body
+        node.headers = req_headers
+        node.status_code = status
+        node.resp_status = status
+        node.resp_reason = reason or ''
+        node.resp_headers = resp_headers
+        node.resp_body = rbody
+        node.content_type = ct
+        node.raw_html = rbody
+        node.text_content = rbody
+        node.scanned = True
+        node.edited = True
+        return node
+
+    def _save_as_node(self):
+        """Save the displayed (sent + caught) flow as a graph node."""
+        f = self._current
+        if not (f is not None and f.status is not None and self.on_save_node):
+            return
+        node = self.build_node(f.method, f.url, f.req_headers, f.req_body,
+                               f.status, f.reason, f.resp_headers, f.resp_body)
+        self.on_save_node(node)
+
+    # ── history ──
+    def record_flow(self, flow):
+        """Snapshot a completed proxied transaction into the history (and push it
+        to an open History popup). Called on the UI thread for every flow the
+        proxy relays, trapped or not."""
+        rq_head, rq_body = split_req_body(flow.raw_request())
+        rs_head, rs_body = split_req_body(flow.raw_response())
+        req_size = len(flow.req_body) if isinstance(flow.req_body, bytes) \
+            else len((flow.req_body or '').encode('utf-8', 'replace'))
+        resp_size = len(flow.resp_body) if isinstance(flow.resp_body, bytes) \
+            else len((flow.resp_body or '').encode('utf-8', 'replace'))
+        rec = {
+            'id': flow.id,
+            'method': flow.method,
+            'url': flow.url,
+            'status': flow.status,
+            'reason': flow.reason,
+            'req_size': req_size,
+            'resp_size': resp_size,
+            'req_headers': dict(flow.req_headers),
+            'resp_headers': dict(flow.resp_headers),
+            'req_head': rq_head,
+            'req_body': rq_body,
+            'resp_head': rs_head,
+            'resp_body': rs_body,
+        }
+        self.history.append(rec)
+        if self._history_win is not None:
+            self._history_win.add_row(rec)
+
+    def _open_history(self):
+        """Open (or focus) the proxy History popup."""
+        if self._history_win is not None and self._history_win.winfo_exists():
+            self._history_win.lift()
+            self._history_win.focus_force()
+            return
+        self._history_win = ProxyHistoryDialog(self.winfo_toplevel(), self)
 
 
 # ─────────────────────────────────────────────
@@ -11722,10 +12300,10 @@ class gui:
         # their path is allowlisted + non-destructive; control it in the
         # Settings ▸ Performance tab.)
         app.scan_btn = Btn(bot, text='  SCAN TARGET  ', command=app._scan_start,
-                           bg='#006400', fg='white')
+                           bg='#2e7d32', fg='white')
         app.scan_btn.pack(side='left', padx=2)
         app.stop_btn = Btn(bot, text=' STOP ', command=app._scan_stop,
-                           bg='#8b0000', fg='white', state='disabled')
+                           bg='#b71c1c', fg='white', state='disabled')
         app.stop_btn.pack(side='left', padx=2)
         app.progress = Chicago95Progress(bot, width=150, height=16)
         app.progress.pack(side='left', padx=6)
@@ -11838,7 +12416,9 @@ class gui:
                                      scope_var=app.scope_var)
         app.graph_panel.pack(fill='both', expand=True)
         app.proxy_panel = ProxyPanel(top, controller=app.proxy,
-                                     on_open_browser=app._open_browser)
+                                     on_open_browser=app._open_browser,
+                                     on_save_node=app._save_proxy_saved_node,
+                                     on_repeat_node=app._repeat_proxy_saved_node)
         app.proxy_panel.pack(side='left', fill='both', expand=True, padx=(4, 0))
         # Shrink the left column to fit the dropdown row exactly (symmetric gaps).
         self.root.after(120, self._fit_site_structure)
@@ -11992,9 +12572,16 @@ class app:
 
     def _apply_scope(self):
         """Scope field committed: apply it live to the proxy (and it's read by the
-        next scan). Out-of-scope requests are never sent."""
+        next scan). Out-of-scope requests are never sent. An open History popup
+        filters on this same scope, so refresh it too."""
         self.proxy.set_scope(self.scope_var.get())
         self._status(f'Scope applied: {self.scope_var.get().strip() or "(none)"}')
+        win = getattr(getattr(self, 'proxy_panel', None), '_history_win', None)
+        if win is not None:
+            try:
+                win._rebuild_list()
+            except Exception:
+                pass
 
     def _proxy_show(self, flow):
         """Controller hook (UI thread): paint the trapped flow in the proxy panel."""
@@ -12011,7 +12598,13 @@ class app:
 
     def _proxy_node(self, flow):
         """Controller hook (UI thread): record a completed proxied transaction as a
-        SiteNode so it appears in the Site Structure tree."""
+        SiteNode so it appears in the Site Structure tree, and add it to the proxy
+        panel's traffic history."""
+        if getattr(self, 'proxy_panel', None) is not None:
+            try:
+                self.proxy_panel.record_flow(flow)
+            except Exception:
+                pass
         try:
             node = SiteNode(url=flow.url, node_type=self._proxy_node_type(flow),
                             parent_url=None)
@@ -12478,6 +13071,21 @@ class app:
         self.graph_panel.add_node(new_node)
         self.count_var.set(f'Nodes: {len(self.graph_panel.nodes)}')
         self._status(f'Added edited node: {new_node.url}')
+
+    def _save_proxy_saved_node(self, node: SiteNode):
+        """Add a SiteNode saved from the Proxy panel / History popup to the graph
+        (uniquifying its URL) and select it so the user sees where it landed."""
+        self._add_edited_node(node)
+        try:
+            self.graph_panel._select_and_center(node.url)
+        except Exception:
+            pass
+        self._status(f'Saved proxy transaction as node: {node.url}')
+
+    def _repeat_proxy_saved_node(self, node: SiteNode):
+        """Open the Repeater seeded with a node built from a proxied transaction;
+        any result it saves becomes an edited graph node."""
+        inspector.repeater(self.root, node, on_save=self._add_edited_node)
 
     def _delete_node(self):
         """Remove the currently-selected node from the graph. Only nodes
