@@ -834,6 +834,137 @@ class ModalToplevel(tk.Toplevel):
 # ─────────────────────────────────────────────
 # AI client
 # ─────────────────────────────────────────────
+class KnowledgeBase:
+    """Loads the CWES (HTB Academy / Web Penetration Tester) knowledge base JSON
+    and exposes its phase → module → category hierarchy plus the leaf markdown
+    content. Serves two consumers: a compact topic index injected as context so
+    BOTH AI models (reconner-ai analysis + the Wizard chat) are grounded in the
+    same reference, and the Wizard popup's three-dropdown reference browser.
+    The file is large (~1.8 MB) so it is parsed lazily on first use."""
+
+    # The build script installs a copy alongside the Wizard's memory; prefer it,
+    # falling back to the original under the user's Study folder.
+    INSTALLED = os.path.expanduser('~/.wizard-ai/cwes_knowledge_base.json')
+    SOURCE = os.path.expanduser('~/Documents/Study/CWES/cwes_knowledge_base.json')
+    # Categories that are labs / practical exercises rather than theory — dropped
+    # on load so neither the AI grounding nor the browser surfaces them.
+    EXCLUDE_CATEGORIES = {'practice'}
+
+    def __init__(self, path=None):
+        self.path = path or self._resolve_path()
+        self._data = None
+        self._loaded = False
+        self.error = ''
+        self._index_cache = None
+
+    @classmethod
+    def _resolve_path(cls):
+        return cls.INSTALLED if os.path.exists(cls.INSTALLED) else cls.SOURCE
+
+    def _load(self):
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            with open(self.path, encoding='utf-8') as f:
+                self._data = self._prune(json.load(f))
+        except Exception as e:
+            self._data = None
+            self.error = str(e)
+
+    def _prune(self, data):
+        """Strip lab/practical-exercise categories (theory only), then drop any
+        module or phase left empty by that removal."""
+        if not isinstance(data, dict) or not isinstance(data.get('phases'), list):
+            return data
+        phases = []
+        for p in data['phases']:
+            mods = []
+            for m in p.get('modules', []):
+                cats = [c for c in m.get('categories', [])
+                        if c.get('category') not in self.EXCLUDE_CATEGORIES]
+                if cats:
+                    m = dict(m, categories=cats)
+                    mods.append(m)
+            if mods:
+                phases.append(dict(p, modules=mods))
+        return dict(data, phases=phases)
+
+    @property
+    def data(self):
+        self._load()
+        return self._data
+
+    def available(self):
+        d = self.data
+        return bool(d and isinstance(d.get('phases'), list) and d['phases'])
+
+    # ── navigation (phase → module → category) ──────────────────────────
+    def phases(self):
+        return [p.get('phase', '') for p in self.data['phases']] \
+            if self.available() else []
+
+    def _phase(self, name):
+        if not self.available():
+            return None
+        for p in self.data['phases']:
+            if p.get('phase') == name:
+                return p
+        return None
+
+    def modules(self, phase):
+        p = self._phase(phase)
+        return [m.get('module', '') for m in p.get('modules', [])] if p else []
+
+    def _module(self, phase, module):
+        p = self._phase(phase)
+        if p:
+            for m in p.get('modules', []):
+                if m.get('module') == module:
+                    return m
+        return None
+
+    @staticmethod
+    def _cat_label(c):
+        return c.get('title') or c.get('category', '')
+
+    def categories(self, phase, module):
+        m = self._module(phase, module)
+        return [self._cat_label(c) for c in m.get('categories', [])] if m else []
+
+    def content(self, phase, module, category):
+        m = self._module(phase, module)
+        if m:
+            for c in m.get('categories', []):
+                if self._cat_label(c) == category:
+                    return c.get('content', '') or ''
+        return ''
+
+    # ── AI grounding ────────────────────────────────────────────────────
+    def index_text(self, cap=3500):
+        """A compact `phase > module: categories` index for injecting as model
+        context so the AI is aware of what the knowledge base covers (the full
+        content is far too large to inject — it is browsed in the popup)."""
+        if not self.available():
+            return ''
+        if self._index_cache is None:
+            meta = self.data.get('metadata', {})
+            lines = [
+                "CWES Web-Pentest Knowledge Base ("
+                + meta.get('source', 'HTB Academy')
+                + "). Reference topics you may draw on "
+                "(phase > module: categories):"
+            ]
+            for p in self.data['phases']:
+                for m in p.get('modules', []):
+                    cats = '; '.join(self._cat_label(c)
+                                     for c in m.get('categories', []))
+                    lines.append(
+                        f"- {p.get('phase', '')} > {m.get('module', '')}: {cats}")
+            self._index_cache = '\n'.join(lines)
+        return self._index_cache[:cap]
+
+
 SYSTEM_PROMPT = (
     "You are Reconner-AI, an elite penetration tester and bug bounty hunter. "
     "Analyze web reconnaissance data and provide actionable security findings. "
@@ -853,6 +984,17 @@ class ollama:
         self.model = model
         self.host = host
         self.temperature = temperature
+        # Shared CWES knowledge base — its compact topic index is folded into
+        # the system prompt so analysis is grounded in the same reference the
+        # Wizard browses. Parsed lazily on first use (large file).
+        self.kb = KnowledgeBase()
+
+    def _system_with_kb(self, base=SYSTEM_PROMPT):
+        """SYSTEM_PROMPT plus the knowledge-base topic index (when available),
+        so reconner-ai grounds its findings in the CWES reference."""
+        kb = getattr(self, 'kb', None)
+        idx = kb.index_text() if kb and kb.available() else ''
+        return base + "\n\n" + idx if idx else base
 
     def _client(self):
         """The Ollama client to use: a host-bound Client when a host is
@@ -883,7 +1025,7 @@ class ollama:
         )
         try:
             r = self._client().chat(model=self.model, messages=[
-                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'system', 'content': self._system_with_kb()},
                 {'role': 'user',   'content': prompt},
             ], options={'temperature': self.temperature})
             return r['message']['content']
@@ -905,7 +1047,7 @@ class ollama:
         )
         try:
             r = self._client().chat(model=self.model, messages=[
-                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'system', 'content': self._system_with_kb()},
                 {'role': 'user',   'content': prompt},
             ], options={'temperature': self.temperature})
             return r['message']['content']
@@ -8383,7 +8525,7 @@ class SettingsDialog(ModalToplevel):
         page = tk.Frame(nb, bg=C['bg'], padx=14, pady=14)
         nb.add(page, text='  About  ')
 
-        tk.Label(page, text='Reconner  v1.3', bg=C['bg'], fg=C['black'],
+        tk.Label(page, text='Reconner  v1.4', bg=C['bg'], fg=C['black'],
                  font=('MS Sans Serif', 12, 'bold')).pack(anchor='w')
         tk.Label(page, text='AI-powered bug bounty reconnaissance tool.',
                  bg=C['bg'], fg=C['black'], font=C['font']).pack(anchor='w', pady=(4, 10))
@@ -8888,6 +9030,7 @@ class RequestEditorDialog(ModalToplevel):
         response."""
         raw = combine_req_body(self.req_txt.get('1.0', 'end'),
                                self.body_txt.get('1.0', 'end')).rstrip()
+        wizard_react('magic')          # Repeater send → Wizard casts
         _set_split(self.resp_txt, self.resp_body_txt, 'Sending… please wait.')
         self.send_btn.config(state='disabled')
         self.save_btn.config(state='disabled')
@@ -8964,6 +9107,7 @@ class RequestEditorDialog(ModalToplevel):
         if not raw or self._do_sel_raw is None:
             messagebox.showinfo('No request', 'Select a request from the list first.')
             return
+        wizard_react('magic')          # Repeater send → Wizard casts
         _set_split(self.do_resp_txt, self.do_resp_body_txt,
                    'Sending… please wait.')
         self.do_send_btn.config(state='disabled')
@@ -9483,6 +9627,7 @@ class FuzzerDialog(ModalToplevel):
             return
 
         self._clear_results()
+        wizard_react('fuzzer')         # Fuzzer run → Wizard casts or scries (random)
         self._running = True
         self._stop_requested = False
         self.start_btn.config(state='disabled')
@@ -12408,17 +12553,31 @@ class WizardAnimator:
 
     OPEN = ['Announce', 'Greet', 'Wave', 'Show']
     CLOSE = ['Greet', 'Wave', 'Hide']
-    IDLE = ['Idle1_1', 'Idle1_2', 'Idle1_3', 'Idle1_4',
-            'Idle2_1', 'Idle2_2', 'Idle3_1', 'Idle3_2']
+    # Random idle moves — NO sleep (Idle3_*); those are reserved for the sleep loop.
+    IDLE = ['Idle1_1', 'Idle1_2', 'Idle1_3', 'Idle1_4', 'Idle2_1', 'Idle2_2']
+    # Sleep = a one-off yawn/stretch (Idle3_1, frames 0..SLEEP_YAWN_END) followed by
+    # the looping sleep (Idle3_2, head drooping). Looping the yawn was the "endless
+    # yawn" bug.
+    SLEEP_YAWN = 'Idle3_1'
+    SLEEP_YAWN_END = 23                 # last yawn frame (before the standing tail)
+    SLEEP_LOOP = 'Idle3_2'
     LISTEN_START = ['Confused', 'Hearing_1', 'Hearing_2', 'Hearing_3', 'Hearing_4',
                     'StartListening']
     # Self-looping animations (loop via `branching`, exit via `exitBranch`).
     LISTEN_LOOPS = ['Reading']
     THINK_LOOPS = ['Reading', 'Processing', 'Thinking', 'Searching']
     SEND_LOOPS = ['Writing', 'Processing']
-    TRICKS = ['Congratulate', 'Congratulate_2', 'DoMagic1', 'DoMagic2']
+    # Reaction animations. The magic spell = DoMagic1 (raise wand to its peak) →
+    # DoMagic2 (cast + settle the wand down ONCE) → RestPose.
+    DOMAGIC1_PEAK = 11                  # last DoMagic1 frame (wand at its peak);
+    #                                     f13–f18 lower the wand back, so we skip them.
+    DOMAGIC2_END = 10                   # last DoMagic2 frame (wand first settles low);
+    #                                     f11+ bob the wand up/down again — skip them.
+    SCRY = 'Searching'                  # gaze into the scry orb (looped)
+    SCRY_MS = (5000, 8000)             # how long to gaze before returning to idle
     REST = 'RestPose'
-    IDLE_REST_MS = (7000, 14000)        # random RestPose spell between idle moves
+    IDLE_REST_MS = 5000                 # fixed 5 s pause between idle moves
+    INACTIVITY_MS = 30000               # → sleep after this long with no interaction
     _EXIT_GUARD = 80                    # max steps while exiting (loop-path safety)
 
     def __init__(self, stage_label, agent, tk_widget):
@@ -12433,6 +12592,7 @@ class WizardAnimator:
         self._gap_after = None
         self._idle_exit_after = None
         self._wind_after = None
+        self._inactive_after = None
         self._cur_photo = None
         # active frame-graph run
         self._cur_anim = None
@@ -12513,6 +12673,33 @@ class WizardAnimator:
         """Tell the running animation to wind down via its exitBranch path."""
         self._exit = True
 
+    def _run_linear(self, anim, on_end=None, last=None):
+        """Play `anim` strictly frame 0→`last` (inclusive; default the last frame)
+        in order, ignoring branching/exitBranch, then call `on_end`. Used to play a
+        specific frame range — e.g. DoMagic1 only up to its wand peak, or the yawn
+        without its standing tail."""
+        self._cancel_frames()
+        frames = self.agent.frames(anim)
+        if not frames:
+            self._frame_after = self.tk.after(1, on_end) if on_end else None
+            return
+        end_i = len(frames) if last is None else min(len(frames), last + 1)
+        self._cur_anim = anim
+        st = {'i': 0}
+
+        def step():
+            i = st['i']
+            if i >= end_i:
+                self._frame_after = None
+                if on_end:
+                    on_end()
+                return
+            self._show(anim, i)
+            dur = max(20, int(frames[i].get('duration', 100) or 0))
+            st['i'] += 1
+            self._frame_after = self.tk.after(dur, step)
+        step()
+
     def _play_sequence(self, anims, on_end=None):
         """Play a list of (one-shot) animations back to back, then call `on_end`."""
         q = [a for a in anims if a]
@@ -12556,6 +12743,7 @@ class WizardAnimator:
         self._on_end = None
         self._cancel_frames()
         self._cancel_gap()
+        self._cancel_inactivity()
 
     # ── seamless loop (listening / thinking / sending) ──
     def _start_loop(self, anim):
@@ -12618,19 +12806,21 @@ class WizardAnimator:
 
     # ── idle ──
     def start_idle(self):
-        """Idle cycle: rest, then random idle moves with random 7–14 s rests."""
+        """Idle cycle: rest, then random idle moves with random 7–14 s rests. Arms
+        the inactivity timer that drops the wizard into a sleep loop after a stretch
+        with no user interaction."""
         self._mode = 'idle'
         self._cancel_gap()
         self._cancel_frames()
         self._show(self.REST, 0)
         self._schedule_idle()
+        self._arm_inactivity()
 
     def _schedule_idle(self):
         if self._mode != 'idle':
             return
         self._cancel_gap()
-        self._gap_after = self.tk.after(
-            random.randint(*self.IDLE_REST_MS), self._do_idle)
+        self._gap_after = self.tk.after(self.IDLE_REST_MS, self._do_idle)
 
     def _do_idle(self):
         if self._mode != 'idle':
@@ -12648,10 +12838,68 @@ class WizardAnimator:
             self._show(self.REST, 0)
             self._schedule_idle()
         self._run(self._pick(self.IDLE), after_idle)
-        # Some idle moves (Idle2_*/Idle3_*) self-loop forever; nudge them to wind
-        # down via exitBranch after a short random spell so the cycle keeps moving.
+        # Some idle moves (Idle2_*) self-loop forever; nudge them to wind down via
+        # exitBranch after a short random spell so the cycle keeps moving.
         self._idle_exit_after = self.tk.after(
             random.randint(2500, 5000), self.request_exit)
+
+    # ── sleep / wake (inactivity) ──
+    def _arm_inactivity(self):
+        """(Re)start the no-interaction → sleep countdown."""
+        self._cancel_inactivity()
+        self._inactive_after = self.tk.after(self.INACTIVITY_MS, self._go_sleep)
+
+    def _cancel_inactivity(self):
+        if self._inactive_after is not None:
+            try:
+                self.tk.after_cancel(self._inactive_after)
+            except Exception:
+                pass
+            self._inactive_after = None
+
+    def _go_sleep(self):
+        """No interaction for INACTIVITY_MS: drop the idle cycle, yawn ONCE, then
+        loop the sleeping animation until poked awake."""
+        self._inactive_after = None
+        if self._mode != 'idle':
+            return
+        self._mode = 'sleeping'
+        self._cancel_gap()              # stop the random idle gestures
+        self._loop_then = self.start_idle
+        self._loop_stop = False
+        sleep = self.SLEEP_LOOP if self.agent.frames(self.SLEEP_LOOP) else self.REST
+
+        def to_sleep():
+            if self._mode != 'sleeping':
+                return
+            if self._loop_stop:         # poked awake during the yawn
+                self._finish_loop()
+            else:
+                self._start_loop(sleep)
+        if self.agent.frames(self.SLEEP_YAWN):
+            self._run_linear(self.SLEEP_YAWN, to_sleep, last=self.SLEEP_YAWN_END)
+        else:
+            to_sleep()
+
+    def poke(self):
+        """Register a user interaction. Wakes the wizard if it's asleep (returning
+        True so the caller skips its normal action this time); otherwise just
+        resets the inactivity countdown. Returns False when no wake was needed."""
+        if self._mode == 'sleeping':
+            self.wake()
+            return True
+        if self._mode == 'idle':
+            self._arm_inactivity()
+        return False
+
+    def wake(self):
+        """Wake from sleep: play the sleep animation's own wake-up tail (its
+        exitBranch path — Merlin has no separate wake animation), then resume the
+        normal idle cycle."""
+        if self._mode != 'sleeping':
+            return
+        self._mode = 'waking'
+        self.end_loop(self.start_idle)
 
     # ── listening (user typing in chat) ──
     def start_listening(self):
@@ -12730,14 +12978,46 @@ class WizardAnimator:
         self.end_loop(self.start_idle)
 
     # ── trick (clicking a Reconner widget) ──
-    def trick(self):
-        """A random celebration (DoMagic1/DoMagic2/Congratulate/…) — only while
-        idle, so it never interrupts a listening/thinking/sending cycle."""
+    def react(self, kind='magic'):
+        """React to a Reconner action. Wakes if asleep; otherwise (only while idle)
+        casts the magic spell — except 'fuzzer', which gazes into the scry orb or
+        casts, chosen at random."""
+        if self._mode == 'sleeping':
+            self.wake()
+            return
         if self._mode != 'idle':
             return
+        if kind == 'fuzzer' and self.agent.frames(self.SCRY) and random.random() < 0.5:
+            self.do_scry()
+        else:
+            self.do_magic()
+
+    def do_magic(self):
+        """Cast: DoMagic1 (up to the wand peak — skip its lowering return) flows
+        straight into DoMagic2 (up to where the wand first settles low — skip its
+        repeated wand-bobbing), then RestPose. Played linearly so branching can't
+        cut it short. One continuous spell, wand settles down exactly once."""
         self._mode = 'trick'
         self._cancel_gap()
-        self._run(self._pick(self.TRICKS), self.start_idle)
+        if not self.agent.frames('DoMagic1'):
+            self.start_idle()
+            return
+        self._run_linear(
+            'DoMagic1',
+            lambda: self._run_linear('DoMagic2', self.start_idle,
+                                     last=self.DOMAGIC2_END),
+            last=self.DOMAGIC1_PEAK)
+
+    def do_scry(self):
+        """Gaze into the scry orb (Searching) on a seamless loop for a few seconds,
+        then return to idle."""
+        self._mode = 'trick'
+        self._cancel_gap()
+        self._loop_then = self.start_idle
+        self._loop_stop = False
+        self._start_loop(self.SCRY)
+        self._gap_after = self.tk.after(
+            random.randint(*self.SCRY_MS), lambda: self.end_loop(self.start_idle))
 
 
 class WizardMemory:
@@ -12874,6 +13154,11 @@ class WizardAssistantDialog(tk.Toplevel):
         self.ai = ai
         self.model = model
         self.on_geometry = on_geometry
+        # Shared CWES knowledge base (same one reconner-ai is grounded in): it
+        # drives the reference browser on the right and the category the seeker
+        # is reading is folded into the chat context.
+        self.kb = getattr(ai, 'kb', None)
+        self._kb_phase = self._kb_module = self._kb_cat = ''
         self.title('Wizard')
         self.configure(bg=C['bg'])
         self.history = []                       # fresh session (nothing replayed)
@@ -12883,7 +13168,6 @@ class WizardAssistantDialog(tk.Toplevel):
         self._stream_cancel = False
         self._first_token = True
         self._wiz_buf = []
-        self._app_click_bind = None
         self.animator = None
         self._build()
         # Restore the last position/size (after _build so it isn't overridden by
@@ -12901,14 +13185,6 @@ class WizardAssistantDialog(tk.Toplevel):
         # Right-click the wizard to clear the current chat.
         self.stage.bind('<Button-3>', self._on_forget_menu)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
-        # Clicking any Reconner widget (in the main window) triggers a trick — the
-        # toplevel is in every child widget's bindtags, so one bind catches them
-        # all. Guarded to idle in the animator.
-        try:
-            self._app_click_bind = self.master.bind(
-                '<Button-1>', self._on_app_click, add='+')
-        except Exception:
-            self._app_click_bind = None
         self.after(150, lambda: self.animator.play_open(self.animator.start_idle))
 
     def _build(self):
@@ -12934,6 +13210,11 @@ class WizardAssistantDialog(tk.Toplevel):
                               relief='flat', bd=0, cursor='hand2')
         self.stage.pack(pady=(8, 0))
         self.stage.bind('<Button-1>', lambda _e: self._on_trick())
+
+        # Far-right column: the CWES knowledge-base reference browser (three
+        # stacked dropdowns + a read-only content pane). Built first so the
+        # chat balloon gets whatever width is left.
+        self._build_kb_panel(body)
 
         right = tk.Frame(body, bg=C['bg'])
         right.pack(side='left', fill='both', expand=True, padx=(8, 0))
@@ -12965,6 +13246,115 @@ class WizardAssistantDialog(tk.Toplevel):
         self.entry.bind('<FocusOut>', self._on_entry_unfocus)
         if self.agent.available():
             self.entry.focus_set()
+
+    # ── knowledge-base reference browser ──
+    def _build_kb_panel(self, body):
+        """The far-right column: three vertically stacked dropdowns (phase →
+        module → category) over a read-only pane showing the selected entry's
+        content, drawn from the shared CWES knowledge base."""
+        panel = tk.Frame(body, bg=C['bg'], width=300)
+        panel.pack(side='right', fill='y')
+        panel.pack_propagate(False)
+        tk.Label(panel, text='Knowledge Base', bg=C['bg'], font=C['font_b'],
+                 anchor='w').pack(fill='x', pady=(8, 4))
+
+        if not (self.kb and self.kb.available()):
+            why = (self.kb.error if self.kb else '') or 'not found'
+            tk.Message(panel, text='CWES knowledge base unavailable:\n' + why,
+                       bg=C['bg'], fg=C['err'], font=C['font'], width=280,
+                       anchor='w', justify='left').pack(fill='x', pady=4)
+            self.kb_content = None
+            return
+
+        def _mkbtn(label):
+            b = tk.Menubutton(panel, text=label, bg=C['btn'],
+                              activebackground=C['btn'], relief='raised', bd=2,
+                              font=C['font'], padx=6, anchor='w',
+                              highlightthickness=0)
+            m = tk.Menu(b, tearoff=0, bg=C['btn'], fg=C['black'],
+                        activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
+                        font=C['font'])
+            b.config(menu=m)
+            b.pack(fill='x', pady=(0, 4))
+            return b, m
+
+        self.kb_phase_btn, self.kb_phase_menu = _mkbtn('Phase ▾')
+        self.kb_module_btn, self.kb_module_menu = _mkbtn('Module ▾')
+        self.kb_cat_btn, self.kb_cat_menu = _mkbtn('Category ▾')
+
+        cwrap = tk.Frame(panel, bg=C['bg'])
+        cwrap.pack(fill='both', expand=True, pady=(4, 8))
+        self.kb_content = Text95(cwrap, width=34, height=10, wrap='word',
+                                 bg=C['window'], relief='sunken', bd=2)
+        csb = tk.Scrollbar(cwrap, orient='vertical',
+                           command=self.kb_content.yview)
+        self.kb_content.config(yscrollcommand=csb.set, state='disabled')
+        self.kb_content.pack(side='left', fill='both', expand=True)
+        csb.pack(side='right', fill='y')
+        self.kb_content.tag_config('hdr', font=C['font_b'],
+                                   foreground=C['title_bg'])
+
+        # Populate the phase dropdown; the rest cascade from a selection.
+        for p in self.kb.phases():
+            self.kb_phase_menu.add_command(
+                label=p, command=lambda p=p: self._kb_pick_phase(p))
+        self._kb_set_content('Pick a phase, module and category above to read '
+                             'the reference for that topic.', placeholder=True)
+
+    def _kb_set_content(self, text, header='', placeholder=False):
+        """Replace the read-only content pane's text (re-enabled briefly to edit)."""
+        if not getattr(self, 'kb_content', None):
+            return
+        self.kb_content.config(state='normal')
+        self.kb_content.delete('1.0', 'end')
+        if header:
+            self.kb_content.insert('end', header + '\n\n', 'hdr')
+        self.kb_content.insert('end', text)
+        self.kb_content.config(state='disabled')
+        self.kb_content.yview_moveto(0.0)
+
+    def _kb_pick_phase(self, phase):
+        self._kb_phase, self._kb_module, self._kb_cat = phase, '', ''
+        self.kb_phase_btn.config(text=phase + ' ▾')
+        self.kb_module_btn.config(text='Module ▾')
+        self.kb_cat_btn.config(text='Category ▾')
+        self.kb_module_menu.delete(0, 'end')
+        self.kb_cat_menu.delete(0, 'end')
+        for m in self.kb.modules(phase):
+            self.kb_module_menu.add_command(
+                label=m, command=lambda m=m: self._kb_pick_module(m))
+        self._kb_set_content('Now pick a module within "%s".' % phase,
+                             placeholder=True)
+
+    def _kb_pick_module(self, module):
+        self._kb_module, self._kb_cat = module, ''
+        self.kb_module_btn.config(text=module + ' ▾')
+        self.kb_cat_btn.config(text='Category ▾')
+        self.kb_cat_menu.delete(0, 'end')
+        for c in self.kb.categories(self._kb_phase, module):
+            self.kb_cat_menu.add_command(
+                label=c, command=lambda c=c: self._kb_pick_cat(c))
+        self._kb_set_content('Now pick a category within "%s".' % module,
+                             placeholder=True)
+
+    def _kb_pick_cat(self, category):
+        self._kb_cat = category
+        self.kb_cat_btn.config(text=category + ' ▾')
+        body = self.kb.content(self._kb_phase, self._kb_module, category)
+        self._kb_set_content(body or '(no content for this category)',
+                             header=category)
+
+    def _kb_selected_content(self, cap=6000):
+        """The category the seeker is currently reading, capped for injection as
+        chat context — empty when nothing (or only a placeholder) is selected."""
+        if not (self.kb and self._kb_cat):
+            return ''
+        body = self.kb.content(self._kb_phase, self._kb_module, self._kb_cat)
+        if not body:
+            return ''
+        clipped = body[:cap]
+        return ("%s > %s > %s\n%s" % (self._kb_phase, self._kb_module,
+                                      self._kb_cat, clipped))
 
     @staticmethod
     def _round_rect(x1, y1, x2, y2, r):
@@ -13016,11 +13406,15 @@ class WizardAssistantDialog(tk.Toplevel):
     # ── typing-in-chat hooks ──
     def _on_entry_type(self, e=None):
         """Engage the listening cycle when the user actually TYPES in the chat
-        (not merely focuses/selects it). The Enter key is ignored here — it sends."""
+        (not merely focuses/selects it). The Enter key is ignored here — it sends.
+        Wakes the wizard first if it had fallen asleep."""
         if e is not None and e.keysym in ('Return', 'KP_Enter'):
             return
-        if not (self._busy or self._closing) and self.animator is not None:
-            self.animator.start_listening()
+        if self._busy or self._closing or self.animator is None:
+            return
+        if self.animator.poke():        # was asleep — woke instead of listening
+            return
+        self.animator.start_listening()
 
     def _on_entry_unfocus(self, _e=None):
         """Deselecting the chat ends listening → idle — but only if it wasn't a
@@ -13039,15 +13433,40 @@ class WizardAssistantDialog(tk.Toplevel):
         self.transcript.insert('end', text + '\n\n')
         self.transcript.see('end')
 
+    def _kb_context_messages(self):
+        """Silent priming that grounds the Wizard in the shared CWES knowledge
+        base: a compact topic index (what it can draw on) plus — when the seeker
+        has a category open in the reference browser — that entry's content, so
+        questions about what they're reading get deep, KB-grounded answers."""
+        if not (self.kb and self.kb.available()):
+            return []
+        idx = self.kb.index_text()
+        if not idx:
+            return []
+        block = ("(KNOWLEDGE BASE — you have a CWES Web-Pentest reference. Use "
+                 "it to ground your guidance; do not invent topics it does not "
+                 "cover. Index of what it holds:)\n\n" + idx)
+        reading = self._kb_selected_content()
+        if reading:
+            block += ("\n\n(The seeker is currently reading this entry — prefer "
+                      "it when they ask about this topic:)\n\n" + reading)
+        return [
+            {'role': 'user', 'content': block},
+            {'role': 'assistant', 'content':
+                "Understood — I'll ground my counsel in the CWES reference and "
+                "lean on whatever passage you're studying."},
+        ]
+
     def _context_messages(self):
         """Silent priming that injects the distilled memory (memory.md) as MEMORIES
         of past, separate sessions — not current-conversation facts. The framing
         tells the model to surface a memory only when relevant, and always as an
         explicit recollection ('I recall…'), so it never asserts a remembered fact
         as something the seeker just said. Empty when there are no notes."""
+        msgs = self._kb_context_messages()
         if not self.memory_notes:
-            return []
-        return [
+            return msgs
+        return msgs + [
             {'role': 'user', 'content':
                 "(MEMORY — these are your private recollections from EARLIER, "
                 "SEPARATE sessions with this seeker. They are NOT part of the "
@@ -13146,18 +13565,17 @@ class WizardAssistantDialog(tk.Toplevel):
         self.entry.focus_set()
         self.animator.stop_sending()
 
-    # ── tricks ──
+    # ── interaction ──
     def _on_trick(self):
-        """Click on the wizard → a trick (when idle)."""
+        """Click on the wizard → just wake it if it's asleep (no trick — tricks are
+        now driven by Reconner actions: Repeater/Fuzzer/settings/data entry)."""
         if self.animator and not self._closing:
-            self.animator.trick()
+            self.animator.poke()
 
-    def _on_app_click(self, _e=None):
-        """Click on any Reconner widget → a trick (when the wizard is idle)."""
-        if self._closing or not self.winfo_exists():
-            return
-        if self.animator is not None:
-            self.animator.trick()
+    def react(self, kind='magic'):
+        """Drive a wizard reaction from a Reconner action (app routes here)."""
+        if self.animator is not None and not self._closing:
+            self.animator.react(kind)
 
     # ── memory ──
     def _on_forget_menu(self, ev):
@@ -13217,16 +13635,34 @@ class WizardAssistantDialog(tk.Toplevel):
             self._finish_close()
 
     def _finish_close(self):
-        """Unhook the app-click bind, tear down the animator, destroy the window."""
-        if self._app_click_bind is not None:
-            try:
-                self.master.unbind('<Button-1>', self._app_click_bind)
-            except Exception:
-                pass
-            self._app_click_bind = None
+        """Tear down the animator and destroy the window."""
         if self.animator is not None:
             self.animator.stop()
         self.destroy()
+
+
+# The app registers a handler here so any component (Repeater, Fuzzer, settings,
+# data-entry fields…) can nudge the open Wizard to react without a direct ref.
+_WIZARD_REACT = None
+
+
+def set_wizard_react(cb):
+    """Install the Wizard-react handler (called once by the app)."""
+    global _WIZARD_REACT
+    _WIZARD_REACT = cb
+
+
+def wizard_react(kind='magic'):
+    """Ask the open Wizard to react to a Reconner action ('magic', or 'fuzzer' for
+    a random magic/scry). No-op when the Wizard isn't open."""
+    cb = _WIZARD_REACT
+    if cb:
+        try:
+            cb(kind)
+        except Exception:
+            pass
+
+
 # ─────────────────────────────────────────────
 # gui — declarative (matrix-driven) widget construction
 # ─────────────────────────────────────────────
@@ -13676,7 +14112,36 @@ class app:
         self.proxy.start()
         # Begin draining proxy→UI callbacks on the main thread.
         self.root.after(50, self._drain_ui_queue)
+        # Let any component nudge the open Wizard, and make committing data in a
+        # single-line field (URL, Scope, settings, …) a Wizard reaction — except
+        # the chat input and the multiline request/response/body editors (Text).
+        set_wizard_react(self._wizard_react)
+        try:
+            self.root.bind_all('<Return>', self._on_data_entry, add='+')
+        except Exception:
+            pass
         self._status('Ready. Enter a target URL and click SCAN.')
+
+    def _wizard_react(self, kind='magic'):
+        """Route a Reconner action to the open Wizard popup (no-op if closed)."""
+        win = getattr(self, '_wizard_win', None)
+        if win is not None and win.winfo_exists():
+            try:
+                win.react(kind)
+            except Exception:
+                pass
+
+    def _on_data_entry(self, ev):
+        """`<Return>` committed in a single-line entry → Wizard reacts. Skips the
+        Wizard's own chat input; multiline editors (request/response/body) are Text,
+        not Entry, so they're excluded automatically."""
+        w = ev.widget
+        if not isinstance(w, tk.Entry):
+            return
+        win = getattr(self, '_wizard_win', None)
+        if win is not None and win.winfo_exists() and w.winfo_toplevel() is win:
+            return                      # the Wizard's chat input — that's a chat
+        self._wizard_react('magic')
 
     # ── proxy glue ──────────────────────────────────────────────────
     def _drain_ui_queue(self):
@@ -13702,6 +14167,7 @@ class app:
         filters on this same scope, so refresh it too."""
         self.proxy.set_scope(self.scope_var.get())
         self._status(f'Scope applied: {self.scope_var.get().strip() or "(none)"}')
+        self._wizard_react('magic')
         win = getattr(getattr(self, 'proxy_panel', None), '_history_win', None)
         if win is not None:
             try:
@@ -13961,6 +14427,8 @@ class app:
         win = getattr(self, '_wizard_win', None)
         if win is not None and win.winfo_exists():
             win.model = s.get('wizard_model', 'wizard-ai')
+        # Changed a config → Wizard reacts.
+        self._wizard_react('magic')
         # Concurrent-browser cap: apply live so raising it mid-scan immediately
         # frees slots for any queued subdomain crawls.
         self._MAX_CONCURRENT_SUBS = max(1, int(s.get('max_concurrent_browsers', 5)))

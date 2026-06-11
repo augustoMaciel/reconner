@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # build-reconner-ai.sh — pull the base, build BOTH Reconner Ollama models
 # (reconner-ai for analysis + wizard-ai for the animated Wizard chat),
-# smoke-test them, and (optionally) point Reconner's settings file at them.
+# install the CWES knowledge base alongside the Wizard's memory, smoke-test the
+# models, and (optionally) point Reconner's settings file at them.
 #
 # Usage:
 #   ./build-reconner-ai.sh                 # default flow (both models)
@@ -23,6 +24,11 @@ MODELFILE="${MODELFILE:-$SCRIPT_DIR/Modelfile.reconner-ai}"
 WIZARD_MODELFILE="${WIZARD_MODELFILE:-$SCRIPT_DIR/Modelfile.wizard-ai}"
 WIZARD_MEMORY_DIR="$HOME/.wizard-ai"
 SETTINGS="$HOME/.reconner/settings.json"
+# CWES knowledge base: authored under the user's Study folder, installed
+# alongside the Wizard's memory so both models (analysis + chat) read a stable
+# copy. Reconner prunes lab/practical-exercise categories on load (theory only).
+KB_SRC="${KB_SRC:-$HOME/Documents/Study/CWES/cwes_knowledge_base.json}"
+KB_DST="$WIZARD_MEMORY_DIR/cwes_knowledge_base.json"
 
 DO_TEST=1
 DO_SETTINGS=1
@@ -90,6 +96,14 @@ if (( DO_WIZARD )); then
     # assistant can store/recall conversations on first run.
     mkdir -p "$WIZARD_MEMORY_DIR"
     ok "memory folder ready: $WIZARD_MEMORY_DIR"
+    # Install the CWES knowledge base alongside the memory (both models read it).
+    if [[ -f "$KB_SRC" ]]; then
+        cp -f "$KB_SRC" "$KB_DST"
+        ok "knowledge base installed: $KB_DST"
+    else
+        printf '\033[1;33m!   knowledge base source not found at %s\033[0m\n' "$KB_SRC"
+        printf '\033[1;33m!   the Wizard reference browser will be empty until it exists\033[0m\n'
+    fi
 fi
 
 # ─── 3. smoke test ───────────────────────────────────────────────────────
