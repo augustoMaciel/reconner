@@ -8774,7 +8774,7 @@ class SettingsDialog(ModalToplevel):
     def _tab_ai(self, nb):
         """Build the AI/Ollama tab (model, host + test, temperature)."""
         page = tk.Frame(nb, bg=C['bg'], padx=12, pady=10)
-        nb.add(page, text='  AI / Ollama  ')
+        nb.add(page, text='  AI  ')
         page.columnconfigure(1, weight=1)
 
         tk.Label(page, text='AI Model:', bg=C['bg'], font=C['font_b'],
@@ -9102,7 +9102,7 @@ class SettingsDialog(ModalToplevel):
         page = tk.Frame(nb, bg=C['bg'], padx=14, pady=14)
         nb.add(page, text='  About  ')
 
-        tk.Label(page, text='Reconner  v1.4', bg=C['bg'], fg=C['black'],
+        tk.Label(page, text='Reconner  v2.0', bg=C['bg'], fg=C['black'],
                  font=('MS Sans Serif', 12, 'bold')).pack(anchor='w')
         tk.Label(page, text='AI-powered bug bounty reconnaissance tool.',
                  bg=C['bg'], fg=C['black'], font=C['font']).pack(anchor='w', pady=(4, 10))
