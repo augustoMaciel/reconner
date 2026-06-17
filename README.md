@@ -20,8 +20,8 @@ Reconner drives a real browser to *navigate a target like a user would* — foll
 - **Authenticated scans** — flip on **Auth Scan** and Reconner pauses when it hits a login wall, shows you the exact request it's about to send, and lets you supply the credential (Bearer / Basic / API key / Cookie / Custom header / Form login). It's then reused for every request to that host.
 - **Subdomain discovery** — passive (links, traffic, JS) plus certificate-transparency (crt.sh) in Aggressive mode, each subdomain getting its own graph and a full crawl. Discovery is **unbounded** (no cap on how many are found or crawled); the only limiter is the **Max concurrent browsers** setting, which throttles how many crawl at once while the rest queue.
 - **Tech fingerprinting** — servers, frameworks, CMSs, CDNs, WAFs, analytics, and more, with optional `whatweb` / `nmap` / `wafw00f` probes.
-- **AI analysis** — an optional local **Ollama** model (`reconner-ai`) summarizes a node's security-relevant details.
-- **The Wizard** — an animated Office-Assistant-style **Merlin** companion (the wizard-hat button by *Nodes:* in the status bar) that chats in a playful-but-precise *"wizardy"* voice, powered by a second local model (`wizard-ai`). He greets, idles, reacts while you type, thinks, and acts out a writing animation as his answer streams in — and does a trick when you click around the app.
+- **AI analysis** — handled entirely by **The Wizard** using one optional local **Ollama** model (`wizard-ai`): its **Analyze Node / Analyze History / Analyze Tech** buttons stream a security breakdown of a chosen item (or **ALL** of them) into the chat.
+- **The Wizard** — an animated Office-Assistant-style **Merlin** companion (the wizard-hat button by *Nodes:* in the status bar) that chats in a playful-but-precise *"wizardy"* voice, powered by the local `wizard-ai` model. He greets, idles, reacts while you type, thinks, and acts out a writing animation as his answer streams in — and does a trick when you click around the app. Three **Analyze** buttons under him (each with a target dropdown) run AI analysis of graph nodes, proxy history, or tech fingerprints, and a built-in **attack reference** browser (≈40 attack types × *Overview / Basic / Advanced / Bypass / Automation*) grounds his answers.
 - **Repeater & Fuzzer** — edit and resend any captured request, with a dedicated **Body** box (and a split request/response view) so multipart/JSON bodies are easy to craft; mark `{{FUZZ}}` positions (in the request *or* body) and run wordlists with ffuf-style match/filter.
 - **High-fidelity, de-noised map** — failure states are kept distinct from real responses: transport errors (request never landed) and `5xx`/unavailable upstreams are flagged on the node (shown in the inspector), while `401`/`403`/`404` stay as legitimate attack surface. Per-locale duplicate endpoints (`…/en/…`, `…/pt/…`, `…/ar-MA/…`) collapse into one representative node so signal isn't buried in repetition.
 - **Export / import** — save a scan (all graphs + data) to JSON and reload it later for offline review.
@@ -79,14 +79,14 @@ sudo apt install -y chromium    # or install Google Chrome
 
 ## Optional: AI analysis setup
 
-The **Analyze with AI** buttons and **The Wizard** chat use local Ollama models. To enable them:
+**The Wizard** — its chat and its **Analyze Node / History / Tech** buttons — uses one local Ollama model. To enable it:
 
 ```bash
 # Install Ollama first: curl -fsSL https://ollama.com/install.sh | sh
 ./build-reconner-ai.sh
 ```
 
-This builds **both** models — **`reconner-ai`** (from `Modelfile.reconner-ai`, used for node/fingerprint analysis) and **`wizard-ai`** (from `Modelfile.wizard-ai`, the conversational model behind [The Wizard](#the-wizard)) — tuned to run comfortably on modest hardware, then points Reconner's settings at them. Pass `--no-wizard` to build only `reconner-ai`. You can change either model name / the host any time in **⚙ Settings ▸ AI / Ollama**. If Ollama isn't running, the rest of Reconner works normally — only the AI features are inert.
+This builds the single **`wizard-ai`** model (from `Modelfile.wizard-ai`, the model behind [The Wizard](#the-wizard) and all AI analysis), installs the CWES knowledge base + the attack-type reference, and points Reconner's settings at it. By default it's built on **Qwen3-Coder 30B** — the strongest free, local coder model — for the best pentest/AppSec reasoning; it's a Mixture-of-Experts model, so only a few experts activate per token and it stays usable even though it exceeds a small GPU (most layers run on CPU/RAM). On a tight box, build a smaller base instead: `BASE=qwen2.5:14b ./build-reconner-ai.sh` (9 GB, fits 16 GB RAM) or `BASE=qwen2.5-coder:7b ./build-reconner-ai.sh` (fast). You can change the model name / host any time in **⚙ Settings ▸ AI / Ollama**. If Ollama isn't running, the rest of Reconner works normally — only the AI features are inert.
 
 ---
 
@@ -230,7 +230,7 @@ Select a node to open the **Node Inspector** panel: its URL, title, status, cont
 
 Per-node tools live in the inspector's **Options ▾** menu (also on the graph's right-click menu):
 
-- **Analyze with AI** — summarize the node's security-relevant surface (needs Ollama).
+- **Open in Browser** — open the node's URL in your system browser. *(For an AI breakdown of a node, open the Wizard and use **Analyze Node**.)*
 - **Send to Repeater** — open the raw request in an editor, tweak anything, resend it, and **Save as New Node** to add the result to the graph. The request line + headers, the **request body**, and the **response** (status/headers and body) each get their own pane, so crafting a multipart upload or JSON body is straightforward. Switch between **Data In** (the request that fetched the node + its response) and **Data Out** (the requests the node can make).
 - **Send to Fuzzer** — mark `{{FUZZ}}` positions in the request **or the body**, load a wordlist, and replay with **ffuf-style match/filter** (`-mc`/`-fc`/`-ms`/`-fs`) and Cluster-bomb / Pitchfork modes. Mark a position **in the URL path** to brute-force and discover hidden endpoints, then **Save Node** the hits.
 - **Set Shell / Open Shell** — once you've landed an uploaded web shell, **Set Shell** spawns a new **shell** node as a *child* of the selected node. You give the shell file/path and the command parameter (both required — no default). The path is resolved against the selected node's URL **as a directory**: on a node `http://example.com/images`, entering `shell.jpg` yields `http://example.com/images/shell.jpg` (an absolute path like `/up/s.php` points anywhere on the host). The new node gets the black-terminal shell icon and is auto-selected. **Open Shell** then opens an interactive **Web Shell** terminal (bright-green-on-black, freely resizable): type a command, hit Enter, and Reconner sends `…/shell.jpg?<param>=<command>` and prints the raw response. A **URL Encode Commands** toggle percent-encodes the command on the wire only — you still see what you typed.
@@ -239,7 +239,15 @@ Per-node tools live in the inspector's **Options ▾** menu (also on the graph's
 
 ## The Wizard
 
-Click the **wizard-hat button** next to *Nodes:* in the status bar to summon **The Wizard** — an animated **Merlin** (the classic Office-Assistant character) who chats about your target in a playful *"wizardy"* voice while delivering precise pentest/AppSec guidance. He's powered by the local **`wizard-ai`** model (separate from `reconner-ai`; set under **⚙ Settings ▸ AI / Ollama ▸ Wizard Model**).
+Click the **wizard-hat button** next to *Nodes:* in the status bar to summon **The Wizard** — an animated **Merlin** (the classic Office-Assistant character) who chats about your target in a playful *"wizardy"* voice while delivering precise pentest/AppSec guidance. He's powered by the local **`wizard-ai`** model (set under **⚙ Settings ▸ AI / Ollama**), the only AI model Reconner uses.
+
+Under the wizard sit three **Analyze** buttons, each with a target dropdown to its right (pick one item or **ALL**):
+
+- **Analyze Node** — security analysis of a graph node (or every node): likely vuln classes, test cases, payloads.
+- **Analyze History** — analysis of intercepted proxy transactions: injectable params, auth/access-control issues, attacks to try.
+- **Analyze Tech** — analysis of a host's technology fingerprint (or all hosts): stack risks, misconfigurations, CVEs, next steps.
+
+Results stream into the same chat balloon, so you can ask follow-ups. The far-right **attack reference** browser has two dropdowns — **Attack** (≈40 types: XSS, SQLi, SSRF, IDOR, file upload, …) and **Section** (Overview / Basic Techniques / Advanced Techniques / Bypass / Automation) — and whatever you're reading is folded into the wizard's context.
 
 Type a question and press **Enter** — his reply streams into a yellow speech balloon. The animation is fully reactive: he **greets** on open, **idles** with little gestures, starts **listening** when you type, **thinks** while the model is silent, acts out a **writing** animation while the answer streams, and plays a **farewell** when you close the window (the close waits for it to finish). Click the wizard — or anything in the app — for a **trick**.
 
@@ -265,7 +273,7 @@ From **Options ▾** → **Export ALL graphs (JSON)**, Reconner writes a `reconn
 
 **⚙ Settings** (stored in `~/.reconner/settings.json`), organized into tabs:
 
-- **AI / Ollama** — Ollama host (default `http://localhost:11434`), the analysis **model** (default `reconner-ai`), the **Wizard Model** (default `wizard-ai`, used by [The Wizard](#the-wizard)), temperature, and a **Test Connection** button.
+- **AI / Ollama** — Ollama host (default `http://localhost:11434`), the **AI Model** (default `wizard-ai`, used by [The Wizard](#the-wizard) for chat and all Analyze actions), temperature, and a **Test Connection** button.
 - **Performance** —
   - **Max concurrent browsers** (default `5`) — how many browser crawls run at once: the primary crawl plus up to N−1 concurrent subdomain crawls; the rest queue. This is the only throttle on subdomain crawling (discovery itself is unbounded). Applies live, including mid-scan.
   - **Max fingerprint workers** (default `8`) — bounded pool size for Tech Scan jobs, so unbounded subdomain discovery can't spawn unlimited HTTP/`nmap`/`whatweb` threads. Independent of the browser limit.
@@ -282,7 +290,7 @@ From **Options ▾** → **Export ALL graphs (JSON)**, Reconner writes a `reconn
 - **Nothing happens on scan / empty tree** — check the target is reachable (try the `www.` host); transient DNS/connection errors are logged in the status area.
 - **HTTPS shows `MOZILLA_PKIX_ERROR_MITM_DETECTED` / cert warnings** — the browser doesn't trust the Reconner CA. Use **Open Browser** (it sets this up), or trust `~/.reconner/ca/reconner-ca.crt` via **Settings ▸ Proxy ▸ Install into system trust**; for Firefox also enable `security.enterprise_roots.enabled`. Installing `libnss3-tools` (`certutil`) lets the launched Firefox profile trust it without sudo.
 - **Proxy didn't start / "bind failed"** — port `8080` is already in use; change it in **Settings ▸ Proxy**.
-- **AI buttons / the Wizard do nothing** — Ollama isn't running or the model name in Settings doesn't exist. Start Ollama and/or run `./build-reconner-ai.sh` (builds both `reconner-ai` and `wizard-ai`).
+- **Analyze buttons / the Wizard do nothing** — Ollama isn't running or the model name in Settings doesn't exist. Start Ollama and/or run `./build-reconner-ai.sh` (builds `wizard-ai`).
 - **The Wizard won't appear** — the Merlin sprites are missing. They're expected at `~/Documents/Projects/Clippy/clippy.js/agents/Merlin/` (`agent.js` + `map.png`); the popup shows the exact path it looked in. Pillow (`pip install pillow`) is also required.
 - **Getting blocked (403 everywhere)** — Reconner already sends a normal (non-headless) User-Agent so the usual headless-browser fingerprint block doesn't apply. If a target still 403s every request it's a stricter WAF/Cloudflare policy — try **Stealth** mode to slow the request rate. (Tech Scan fingerprints often still succeed even when the crawl is blocked.)
 - **Auth header not on page loads** — you're on Firefox; install Chrome for CDP header injection (the request/probe path is still authenticated).

@@ -20,12 +20,12 @@ import random
 import html as _html
 from pathlib import Path
 import re
+import uuid
 import warnings
-import webbrowser
 import socketserver
 import tempfile
 import queue
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, quote
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, quote, unquote
 
 
 # ── Hide hidden (dot-prefixed) files/dirs in every Tk file dialog ──────────
@@ -206,8 +206,7 @@ SETTINGS_FILE = SETTINGS_DIR / 'settings.json'
 
 DEFAULT_SETTINGS = {
     'ollama_host':      'http://localhost:11434',
-    'model':            'reconner-ai',
-    'wizard_model':     'wizard-ai',      # conversational model for the Wizard
+    'wizard_model':     'wizard-ai',      # the single Ollama model (Wizard chat + Analyze)
     'temperature':      0.7,
     'font_size':        8,
     'icon_resolution':  'Low',        # graph node-icon detail: High/Medium/Low
@@ -710,24 +709,29 @@ class Chicago95Progress(tk.Frame):
 
 
 class StatusBox(tk.Frame):
-    """Small square box that shows a green check (success) or red X (failure)."""
-    GREEN = '#2e7d32'
-    RED   = '#b71c1c'
+    """Small square box that shows a green check (success), red X (failure) or a
+    yellow pause symbol (scan paused on an intercepted request)."""
+    GREEN  = '#2e7d32'
+    RED    = '#b71c1c'
+    YELLOW = '#f9a825'
 
     def __init__(self, parent, size=18, **kw):
         """Build the small sunken canvas the check/X is drawn on."""
         super().__init__(parent, bg=C['bg'], **kw)
         self.size = size
+        self.state = ''                 # '' / 'pause' / 'success' / 'fail'
         self.cv = tk.Canvas(self, width=size, height=size, bg=C['window'],
                             relief='sunken', bd=2, highlightthickness=0)
         self.cv.pack()
 
     def clear(self):
         """Erase the indicator."""
+        self.state = ''
         self.cv.delete('all')
 
     def success(self):
-        """Draw a green check mark."""
+        """Draw a green check mark (scan concluded)."""
+        self.state = 'success'
         self.cv.delete('all')
         s = self.size
         self.cv.create_line(s * 0.22, s * 0.52, s * 0.42, s * 0.74, s * 0.80, s * 0.24,
@@ -735,12 +739,23 @@ class StatusBox(tk.Frame):
 
     def fail(self):
         """Draw a red X."""
+        self.state = 'fail'
         self.cv.delete('all')
         s = self.size
         self.cv.create_line(s * 0.26, s * 0.26, s * 0.74, s * 0.74,
                             fill=self.RED, width=3, capstyle='round')
         self.cv.create_line(s * 0.74, s * 0.26, s * 0.26, s * 0.74,
                             fill=self.RED, width=3, capstyle='round')
+
+    def pause(self):
+        """Draw a yellow pause symbol (two vertical bars) — scan paused on an
+        intercepted request, awaiting forward/drop."""
+        self.state = 'pause'
+        self.cv.delete('all')
+        s = self.size
+        for x in (s * 0.37, s * 0.63):
+            self.cv.create_line(x, s * 0.24, x, s * 0.76,
+                                fill=self.YELLOW, width=3, capstyle='round')
 
 
 class ModalToplevel(tk.Toplevel):
@@ -756,19 +771,34 @@ class ModalToplevel(tk.Toplevel):
     - Focus moving *between widgets inside the popup* is ignored so typing
       in entries / text widgets doesn't trigger a flash."""
 
-    def __init__(self, parent, **kw):
+    def __init__(self, parent, modal=True, **kw):
         """Make the window transient to `parent` and arm the modal grab and the
         focus-flash binding. The grab is deferred on a short timer so the
         subclass __init__ can finish laying out and sizing itself first
-        (wait_visibility() here can wedge the dialog before it ever maps)."""
+        (wait_visibility() here can wedge the dialog before it ever maps).
+
+        `modal=False` makes a NON-blocking popup — no input grab and no focus
+        flash — so other windows (in this app or other OS apps) stay usable while
+        it's open. (`run_child_dialog` still works, as a plain pass-through.)"""
+        remember = kw.pop('remember', True)
         super().__init__(parent, **kw)
+        self._modal = modal
         self._modal_suspended = False
+        # Deliberately NOT transient: xfwm4 (and most WMs) exclude transient/dialog
+        # windows from edge-tiling (snap to half / quarter screen). Keeping popups
+        # as normal top-level windows lets the user tile them like any other window
+        # (matching the History / browser windows). Modal popups still block the
+        # parent via grab_set; lift so the popup opens on top of it.
         try:
-            self.transient(parent)
+            self.lift()
         except tk.TclError:
             pass
-        self.after(120, self._enable_modal)
-        self.bind('<FocusOut>', self._flash_if_outside, add='+')
+        if modal:
+            self.after(120, self._enable_modal)
+            self.bind('<FocusOut>', self._flash_if_outside, add='+')
+        # Every popup remembers its last size + position and is fully resizable.
+        if remember:
+            remember_popup_geometry(self, type(self).__name__)
 
     def run_child_dialog(self, fn, *args, **kw):
         """Run a native sub-dialog (file picker / messagebox) without the modal
@@ -790,7 +820,8 @@ class ModalToplevel(tk.Toplevel):
     def _enable_modal(self):
         """Grab input to this window and force keyboard focus onto it (best
         effort — silently tolerates a window that has already gone away)."""
-        if not self.winfo_exists() or self._modal_suspended:
+        if (not getattr(self, '_modal', True) or not self.winfo_exists()
+                or self._modal_suspended):
             return
         try:
             self.grab_set()
@@ -829,6 +860,236 @@ class ModalToplevel(tk.Toplevel):
         self.after(50, self._enable_modal)
 
 
+# ─────────────────────────────────────────────
+# Popup geometry persistence — every popup remembers its last size + position and
+# is fully resizable. Keyed by a stable name, stored in ~/.reconner/popups.json.
+# ─────────────────────────────────────────────
+_POPUP_GEOM_FILE = SETTINGS_DIR / 'popups.json'
+_popup_geom_cache = None
+
+
+def _popup_geom_store():
+    """The in-memory geometry dict (loaded once from disk)."""
+    global _popup_geom_cache
+    if _popup_geom_cache is None:
+        try:
+            _popup_geom_cache = json.loads(_POPUP_GEOM_FILE.read_text())
+        except Exception:
+            _popup_geom_cache = {}
+    return _popup_geom_cache
+
+
+def _popup_geom_flush():
+    """Write the geometry dict back to disk (best effort)."""
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        _POPUP_GEOM_FILE.write_text(json.dumps(_popup_geom_store(), indent=2))
+    except Exception:
+        pass
+
+
+def remember_popup_geometry(win, key, default_size=None):
+    """Make `win` fully resizable, restore its saved size + position (keyed by
+    `key`) and persist them as they change. On first open (nothing saved) the
+    window keeps whatever geometry it set itself, unless `default_size` (w, h) is
+    given. The saved value is captured up-front so the dialog's own __init__
+    geometry calls (which fire <Configure>) can't clobber it before we restore."""
+    try:
+        win.resizable(True, True)
+    except tk.TclError:
+        pass
+    store = _popup_geom_store()
+    saved = store.get(key)
+
+    def restore():
+        if not win.winfo_exists():
+            return
+        if saved:
+            try:
+                win.geometry(saved)
+            except tk.TclError:
+                pass
+        elif default_size:
+            try:
+                win.geometry('%dx%d' % tuple(default_size))
+            except tk.TclError:
+                pass
+
+    # Defer so this wins over geometry the dialog sets in its own __init__.
+    win.after_idle(restore)
+
+    def save(_e=None):
+        if _e is not None and getattr(_e, 'widget', None) is not win:
+            return
+        if not win.winfo_exists():
+            return
+        try:
+            store[key] = win.geometry()
+        except tk.TclError:
+            pass
+
+    def on_destroy(e):
+        if getattr(e, 'widget', None) is win:
+            save()
+            _popup_geom_flush()
+
+    win.bind('<Configure>', save, add='+')
+    win.bind('<Destroy>', on_destroy, add='+')
+
+
+def arm_menu_autoclose(menu, owner, delay=170):
+    """Make a posted menu tree behave like a proper hover-driven menu:
+      • hovering a suboption opens its submenu (native Tk — left untouched);
+      • moving the pointer back onto a parent menu closes the submenu(s) below it;
+      • the whole tree closes only once the pointer is outside EVERY menu box.
+    `menu` is the top menu; `owner` is any live widget (for `.after` / pointer
+    queries). The close-all decision is geometry-based (it checks where the pointer
+    actually is), so crossing the gap between two adjacent menu boxes never
+    dismisses the tree by mistake — the flaw of a pure <Enter>/<Leave> race."""
+    # Map the whole tree: each menu -> its direct cascade-child menus.
+    children = {}
+
+    def collect(m):
+        if m in children:
+            return
+        kids = []
+        children[m] = kids
+        try:
+            end = m.index('end')
+        except tk.TclError:
+            end = None
+        for i in range(0, (end + 1) if end is not None else 0):
+            try:
+                if m.type(i) == 'cascade':
+                    sub = m.nametowidget(m.entrycget(i, 'menu'))
+                    kids.append(sub)
+                    collect(sub)
+            except (tk.TclError, KeyError):
+                continue
+
+    collect(menu)
+    all_menus = list(children)
+    state = {'after': None}
+
+    def cancel():
+        if state['after'] is not None:
+            try:
+                owner.after_cancel(state['after'])
+            except Exception:
+                pass
+            state['after'] = None
+
+    def unpost(m):
+        try:
+            m.unpost()
+        except tk.TclError:
+            pass
+
+    def descendants(m):
+        out, stack = [], list(children.get(m, ()))
+        while stack:
+            d = stack.pop()
+            out.append(d)
+            stack.extend(children.get(d, ()))
+        return out
+
+    def pointer_outside_all():
+        try:
+            px, py = owner.winfo_pointerx(), owner.winfo_pointery()
+        except tk.TclError:
+            return False
+        for m in all_menus:
+            try:
+                if not m.winfo_ismapped():
+                    continue
+                x, y = m.winfo_rootx(), m.winfo_rooty()
+                if (x <= px < x + m.winfo_width()
+                        and y <= py < y + m.winfo_height()):
+                    return False
+            except tk.TclError:
+                continue
+        return True
+
+    def check_close_all():
+        state['after'] = None
+        if not pointer_outside_all():
+            return
+        # tk::MenuUnpost dismisses (and clears Priv(postedMb) for) a menubutton
+        # menu so it reopens cleanly; the explicit unposts cover tk_popup menus.
+        try:
+            owner.tk.call('tk::MenuUnpost', '')
+        except tk.TclError:
+            pass
+        for m in all_menus:
+            unpost(m)
+
+    def on_leave(_e=None):
+        cancel()
+        try:
+            state['after'] = owner.after(delay, check_close_all)
+        except Exception:
+            pass
+
+    def on_enter(m):
+        # Back on a parent menu → close whatever was opened below it. Tk reposts a
+        # child if the pointer then rests on its cascade entry, so this only prunes
+        # the levels you've actually stepped back out of.
+        cancel()
+        for d in descendants(m):
+            if d.winfo_ismapped():
+                unpost(d)
+
+    def on_motion(m):
+        # Open a suboption's submenu the instant the pointer rests on it (no wait),
+        # so hovering an entry-with-suboptions automatically reveals them.
+        # postcascade has no tkinter method — call the Tcl command directly.
+        try:
+            if m.type('active') == 'cascade':
+                m.tk.call(str(m), 'postcascade', 'active')
+        except tk.TclError:
+            pass
+
+    for m in all_menus:
+        # Bind each menu once even if it is reachable from several trees (e.g. the
+        # graph's _options_menu is reused inside its right-click menu) so handlers
+        # don't pile up across re-opens.
+        if getattr(m, '_autoclose_bound', False):
+            continue
+        m._autoclose_bound = True
+        m.bind('<Enter>', lambda _e, mm=m: on_enter(mm), add='+')
+        m.bind('<Leave>', on_leave, add='+')
+        m.bind('<Motion>', lambda _e, mm=m: on_motion(mm), add='+')
+
+
+def bind_rightclick_menu(root, menu):
+    """Right-click ANYWHERE inside `root` (and its current descendants) posts
+    `menu` — the same menu an Options ▾ menubutton drops — at the cursor. `menu`
+    may be a `tk.Menu` or a no-arg callable returning one. Widgets that already
+    have their own <Button-3> handler (e.g. a tree's context menu) are left alone
+    so this doesn't clobber them."""
+    def post(ev):
+        m = menu() if callable(menu) else menu
+        if m is None:
+            return None
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            try:
+                m.grab_release()
+            except tk.TclError:
+                pass
+        return 'break'
+
+    def walk(w):
+        try:
+            if not w.bind('<Button-3>'):
+                w.bind('<Button-3>', post, add='+')
+        except tk.TclError:
+            pass
+        for c in w.winfo_children():
+            walk(c)
+
+    walk(root)
 
 
 # ─────────────────────────────────────────────
@@ -836,30 +1097,44 @@ class ModalToplevel(tk.Toplevel):
 # ─────────────────────────────────────────────
 class KnowledgeBase:
     """Loads the CWES (HTB Academy / Web Penetration Tester) knowledge base JSON
-    and exposes its phase → module → category hierarchy plus the leaf markdown
-    content. Serves two consumers: a compact topic index injected as context so
-    BOTH AI models (reconner-ai analysis + the Wizard chat) are grounded in the
-    same reference, and the Wizard popup's three-dropdown reference browser.
-    The file is large (~1.8 MB) so it is parsed lazily on first use."""
+    and exposes a phase-agnostic module → section view of its leaf markdown
+    content. Handles both shapes transparently: the FULL base is phase-nested
+    (phases > modules > categories) and grounds the AI; the SUMMARY base is flat
+    (modules > sections) and drives the Wizard's two-dropdown browser. Serves a
+    compact topic index injected as context for the Wizard (chat + the Analyze
+    actions). Parsed lazily on first use."""
 
     # The build script installs a copy alongside the Wizard's memory; prefer it,
-    # falling back to the original under the user's Study folder.
-    INSTALLED = os.path.expanduser('~/.wizard-ai/cwes_knowledge_base.json')
+    # falling back to the original under the user's Study folder. Two variants:
+    # the FULL base grounds the Wizard AI (deep content), the SUMMARY base — a
+    # condensed, examples-removed theory rewrite (see build-kb-summary.py) — is
+    # what the popup's dropdown browser shows the user.
+    INSTALLED = os.path.expanduser('~/.reconner/cwes_knowledge_base.json')
     SOURCE = os.path.expanduser('~/Documents/Study/CWES/cwes_knowledge_base.json')
+    SUMMARY_INSTALLED = os.path.expanduser(
+        '~/.reconner/cwes_knowledge_base_summary.json')
+    SUMMARY_SOURCE = os.path.expanduser(
+        '~/Documents/Study/CWES/cwes_knowledge_base_summary.json')
     # Categories that are labs / practical exercises rather than theory — dropped
     # on load so neither the AI grounding nor the browser surfaces them.
     EXCLUDE_CATEGORIES = {'practice'}
 
-    def __init__(self, path=None):
-        self.path = path or self._resolve_path()
+    def __init__(self, path=None, summary=False):
+        self.summary = summary
+        self.path = path or self._resolve_path(summary)
         self._data = None
         self._loaded = False
         self.error = ''
         self._index_cache = None
 
     @classmethod
-    def _resolve_path(cls):
-        return cls.INSTALLED if os.path.exists(cls.INSTALLED) else cls.SOURCE
+    def _resolve_path(cls, summary=False):
+        cands = ((cls.SUMMARY_INSTALLED, cls.SUMMARY_SOURCE) if summary
+                 else (cls.INSTALLED, cls.SOURCE))
+        for p in cands:
+            if os.path.exists(p):
+                return p
+        return cands[0]
 
     def _load(self):
         if self._loaded:
@@ -873,22 +1148,32 @@ class KnowledgeBase:
             self.error = str(e)
 
     def _prune(self, data):
-        """Strip lab/practical-exercise categories (theory only), then drop any
-        module or phase left empty by that removal."""
-        if not isinstance(data, dict) or not isinstance(data.get('phases'), list):
+        """Strip lab/practical-exercise sections (theory only), then drop any
+        module/phase left empty. Handles both shapes: the FULL base is
+        phase-nested (phases > modules > categories), the SUMMARY base is flat
+        (modules > sections)."""
+        if not isinstance(data, dict):
             return data
-        phases = []
-        for p in data['phases']:
-            mods = []
-            for m in p.get('modules', []):
-                cats = [c for c in m.get('categories', [])
-                        if c.get('category') not in self.EXCLUDE_CATEGORIES]
-                if cats:
-                    m = dict(m, categories=cats)
-                    mods.append(m)
-            if mods:
-                phases.append(dict(p, modules=mods))
-        return dict(data, phases=phases)
+
+        def keep(m):
+            secs = [c for c in self._sections_of(m)
+                    if self._sec_key(c) not in self.EXCLUDE_CATEGORIES]
+            if not secs:
+                return None
+            key = 'sections' if 'sections' in m else 'categories'
+            return dict(m, **{key: secs})
+
+        if isinstance(data.get('modules'), list):          # flat (summary)
+            mods = [k for m in data['modules'] if (k := keep(m))]
+            return dict(data, modules=mods)
+        if isinstance(data.get('phases'), list):           # nested (full)
+            phases = []
+            for p in data['phases']:
+                mods = [k for m in p.get('modules', []) if (k := keep(m))]
+                if mods:
+                    phases.append(dict(p, modules=mods))
+            return dict(data, phases=phases)
+        return data
 
     @property
     def data(self):
@@ -897,54 +1182,66 @@ class KnowledgeBase:
 
     def available(self):
         d = self.data
-        return bool(d and isinstance(d.get('phases'), list) and d['phases'])
+        return bool(isinstance(d, dict) and (d.get('modules') or d.get('phases')))
 
-    # ── navigation (phase → module → category) ──────────────────────────
-    def phases(self):
-        return [p.get('phase', '') for p in self.data['phases']] \
-            if self.available() else []
-
-    def _phase(self, name):
-        if not self.available():
-            return None
-        for p in self.data['phases']:
-            if p.get('phase') == name:
-                return p
-        return None
-
-    def modules(self, phase):
-        p = self._phase(phase)
-        return [m.get('module', '') for m in p.get('modules', [])] if p else []
-
-    def _module(self, phase, module):
-        p = self._phase(phase)
-        if p:
-            for m in p.get('modules', []):
-                if m.get('module') == module:
-                    return m
-        return None
+    # ── navigation (module → section, phase-agnostic) ───────────────────
+    @staticmethod
+    def _sections_of(m):
+        """A module's leaf entries, under either the flat 'sections' key
+        (summary) or the nested 'categories' key (full)."""
+        return m.get('sections') or m.get('categories') or []
 
     @staticmethod
-    def _cat_label(c):
-        return c.get('title') or c.get('category', '')
+    def _sec_title(c):
+        return c.get('title') or c.get('section') or c.get('category', '')
 
-    def categories(self, phase, module):
-        m = self._module(phase, module)
-        return [self._cat_label(c) for c in m.get('categories', [])] if m else []
+    @staticmethod
+    def _sec_key(c):
+        """Stable identifier for a section, unaffected by title renames — used
+        to match a summary section to its full-content counterpart."""
+        return c.get('section') or c.get('category') or c.get('title', '')
 
-    def content(self, phase, module, category):
-        m = self._module(phase, module)
+    def _module_dicts(self):
+        """All module dicts, flattening the FULL base's phases so callers never
+        deal with the phase layer."""
+        d = self.data
+        if not isinstance(d, dict):
+            return []
+        if isinstance(d.get('modules'), list):
+            return d['modules']
+        out = []
+        for p in d.get('phases', []):
+            out.extend(p.get('modules', []))
+        return out
+
+    def module_names(self):
+        return [m.get('module', '') for m in self._module_dicts()]
+
+    def _module(self, name):
+        for m in self._module_dicts():
+            if m.get('module') == name:
+                return m
+        return None
+
+    def sections(self, module):
+        """The section dicts of a module (each has title + key + content)."""
+        m = self._module(module)
+        return list(self._sections_of(m)) if m else []
+
+    def content_for(self, module, section):
+        """Content of a section, matched by stable key OR display title."""
+        m = self._module(module)
         if m:
-            for c in m.get('categories', []):
-                if self._cat_label(c) == category:
+            for c in self._sections_of(m):
+                if section in (self._sec_key(c), self._sec_title(c)):
                     return c.get('content', '') or ''
         return ''
 
     # ── AI grounding ────────────────────────────────────────────────────
     def index_text(self, cap=3500):
-        """A compact `phase > module: categories` index for injecting as model
-        context so the AI is aware of what the knowledge base covers (the full
-        content is far too large to inject — it is browsed in the popup)."""
+        """A compact `module: sections` index injected as model context so the
+        AI is aware of what the knowledge base covers (the full content is far
+        too large to inject — it is browsed in the popup)."""
         if not self.available():
             return ''
         if self._index_cache is None:
@@ -952,49 +1249,29 @@ class KnowledgeBase:
             lines = [
                 "CWES Web-Pentest Knowledge Base ("
                 + meta.get('source', 'HTB Academy')
-                + "). Reference topics you may draw on "
-                "(phase > module: categories):"
+                + "). Reference topics you may draw on (module: sections):"
             ]
-            for p in self.data['phases']:
-                for m in p.get('modules', []):
-                    cats = '; '.join(self._cat_label(c)
-                                     for c in m.get('categories', []))
-                    lines.append(
-                        f"- {p.get('phase', '')} > {m.get('module', '')}: {cats}")
+            for m in self._module_dicts():
+                secs = '; '.join(self._sec_title(c)
+                                 for c in self._sections_of(m))
+                lines.append(f"- {m.get('module', '')}: {secs}")
             self._index_cache = '\n'.join(lines)
         return self._index_cache[:cap]
-
-
-SYSTEM_PROMPT = (
-    "You are Reconner-AI, an elite penetration tester and bug bounty hunter. "
-    "Analyze web reconnaissance data and provide actionable security findings. "
-    "Identify: XSS, SQLi, IDOR, SSRF, open redirects, LFI/RFI, auth bypasses, "
-    "info disclosure, misconfigurations, interesting parameters and endpoints. "
-    "Be concise. Prioritize high-impact findings. Give specific payloads when relevant."
-)
 
 
 class ollama:
     """Ollama client: holds the model/host/temperature config and makes the
     chat requests, returning the model's text output. (Named per the project's
     class scheme; the underlying ollama library is imported as `ollama_lib`.)"""
-    def __init__(self, model='reconner-ai', host='', temperature=0.7):
+    def __init__(self, model='wizard-ai', host='', temperature=0.7):
         """Store the model name, Ollama host (empty = library default), and
         sampling temperature."""
         self.model = model
         self.host = host
         self.temperature = temperature
-        # Shared CWES knowledge base — its compact topic index is folded into
-        # the system prompt so analysis is grounded in the same reference the
-        # Wizard browses. Parsed lazily on first use (large file).
+        # Shared CWES knowledge base — its compact topic index grounds the Wizard
+        # (chat + the Analyze actions). Parsed lazily on first use (large file).
         self.kb = KnowledgeBase()
-
-    def _system_with_kb(self, base=SYSTEM_PROMPT):
-        """SYSTEM_PROMPT plus the knowledge-base topic index (when available),
-        so reconner-ai grounds its findings in the CWES reference."""
-        kb = getattr(self, 'kb', None)
-        idx = kb.index_text() if kb and kb.available() else ''
-        return base + "\n\n" + idx if idx else base
 
     def _client(self):
         """The Ollama client to use: a host-bound Client when a host is
@@ -1002,57 +1279,6 @@ class ollama:
         if self.host:
             return ollama_lib.Client(host=self.host)
         return ollama_lib
-
-    def analyze_node(self, node: SiteNode) -> str:
-        """Ask the model for a security analysis of a single node and return its
-        text. Returns a bracketed message instead if Ollama is unavailable or
-        the request errors."""
-        if not OLLAMA_AVAILABLE:
-            return '[Ollama not installed: pip install ollama]'
-        prompt = (
-            f"Analyze this endpoint for security vulnerabilities:\n\n"
-            f"URL: {node.url}\n"
-            f"Type: {node.node_type}\n"
-            f"Status: {node_status_label(node)}\n"
-            f"Content-Type: {node.content_type}\n"
-            f"Title: {node.title}\n"
-            f"GET params: {json.dumps(node.get_params) if node.get_params else 'none'}\n"
-            f"Forms: {json.dumps(node.forms) if node.forms else 'none'}\n"
-            f"Links: {len(node.links)} found\n"
-            f"Headers: {json.dumps(dict(list(node.headers.items())[:8]))}\n\n"
-            f"Page snippet:\n{node.text_content[:600]}\n\n"
-            "List vulnerabilities, test cases, and payloads."
-        )
-        try:
-            r = self._client().chat(model=self.model, messages=[
-                {'role': 'system', 'content': self._system_with_kb()},
-                {'role': 'user',   'content': prompt},
-            ], options={'temperature': self.temperature})
-            return r['message']['content']
-        except Exception as e:
-            return f'[AI error: {e}]'
-
-    def analyze_fingerprint(self, fingerprint_text: str) -> str:
-        """Ask the model to summarise a technology fingerprint and suggest
-        next steps, returning its text (or a bracketed error/unavailable note)."""
-        if not OLLAMA_AVAILABLE:
-            return '[Ollama not installed: pip install ollama]'
-        prompt = (
-            "Below is a technology fingerprint of a target site. Summarise the "
-            "tech stack (server, language, framework, libraries, CMS, CDN, API "
-            "style), call out classes of vulnerabilities and common "
-            "misconfigurations associated with each detected technology, and "
-            "suggest next reconnaissance steps.\n\n"
-            f"{fingerprint_text[:8000]}"
-        )
-        try:
-            r = self._client().chat(model=self.model, messages=[
-                {'role': 'system', 'content': self._system_with_kb()},
-                {'role': 'user',   'content': prompt},
-            ], options={'temperature': self.temperature})
-            return r['message']['content']
-        except Exception as e:
-            return f'[AI error: {e}]'
 
     def chat_stream(self, messages, model=None, on_token=None,
                     is_cancelled=None):
@@ -2840,6 +3066,119 @@ _API_PROBE_WORDS = (
 )
 API_PROBE_WORDLIST = tuple(dict.fromkeys(_API_PROBE_WORDS))
 
+# Common static / metadata / exposure files a directory fuzzer should always
+# check — the file-side counterpart to the API wordlist (which is endpoint-only
+# and so was missing robots.txt, sitemap.xml, …). Probed in EVERY mode (these are
+# benign GETs, high-signal, and robots.txt/sitemap.xml seed further paths). Kept
+# distinct from API_PROBE_WELLKNOWN (security.txt already lives there).
+COMMON_FILES = (
+    # crawler / metadata conventions
+    '/robots.txt', '/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml',
+    '/humans.txt', '/ads.txt', '/app-ads.txt', '/crossdomain.xml',
+    '/clientaccesspolicy.xml', '/manifest.json', '/manifest.webmanifest',
+    '/browserconfig.xml', '/favicon.ico', '/.well-known/',
+    '/.well-known/change-password',
+    # frequently-exposed source / config / status artefacts
+    '/.git/HEAD', '/.gitignore', '/.svn/entries', '/.env', '/.htaccess',
+    '/web.config', '/package.json', '/composer.json', '/Dockerfile',
+    '/.DS_Store', '/server-status', '/server-info', '/phpinfo.php', '/info.php',
+    '/.well-known/assetlinks.json',
+)
+
+# ── Content-discovery wordlists (the Fuzzing scan type brute-forces these at the
+#    web root so it surfaces PAGES, FILES and APIs, not just API resources).
+#    Categorical (admin/auth/dev/infra/content/cms), so they generalise across
+#    sites rather than matching one product. ──────────────────────────────────
+# Directory / page names, probed bare at the root (e.g. /admin, /backup, /dev).
+FUZZ_DIRS = (
+    # admin / panels / accounts
+    'admin', 'administrator', 'administration', 'admins', 'panel', 'cpanel',
+    'controlpanel', 'adminpanel', 'manage', 'manager', 'management', 'console',
+    'dashboard', 'backend', 'backoffice', 'portal', 'webadmin', 'phpmyadmin',
+    'pma', 'adminer', 'myadmin', 'wp-admin', 'user', 'users', 'account',
+    'accounts', 'profile', 'members',
+    # auth
+    'login', 'logout', 'signin', 'signup', 'register', 'auth', 'oauth', 'sso',
+    # dev / test / staging / archive
+    'dev', 'development', 'test', 'testing', 'tests', 'staging', 'stage', 'demo',
+    'beta', 'qa', 'sandbox', 'tmp', 'temp', 'old', 'new', 'bak', 'backup',
+    'backups', 'archive', 'archives', 'sample', 'samples', 'example', 'examples',
+    # infra / config / system
+    'config', 'configuration', 'conf', 'settings', 'setup', 'install',
+    'installer', 'includes', 'include', 'inc', 'lib', 'libs', 'vendor', 'src',
+    'app', 'application', 'system', 'sys', 'core', 'internal', 'private',
+    'secret', 'secure', 'hidden', 'cgi-bin', 'bin', 'scripts', 'script',
+    # content / storage
+    'uploads', 'upload', 'files', 'file', 'download', 'downloads', 'media',
+    'assets', 'static', 'public', 'data', 'db', 'database', 'sql', 'dump',
+    'dumps', 'logs', 'log', 'images', 'img', 'css', 'js', 'fonts', 'docs',
+    'doc', 'documentation', 'documents',
+    # apps / cms / sections
+    'blog', 'shop', 'store', 'cms', 'wp', 'wordpress', 'joomla', 'drupal',
+    'api', 'rest', 'graphql', 'mobile', 'apps', 'web', 'site', 'home', 'main',
+    'search', 'contact', 'about', 'help', 'support', 'status', 'health',
+)
+
+# Common standalone file base names, each paired with FUZZ_EXTENSIONS at the
+# root (e.g. config.php, backup.zip, db.sql, .env.bak, wp-config.php.old).
+FUZZ_FILE_STEMS = (
+    'index', 'default', 'home', 'main', 'app', 'application', 'config',
+    'configuration', 'settings', 'setup', 'install', 'database', 'db', 'data',
+    'backup', 'backups', 'bak', 'dump', 'export', 'users', 'accounts', 'admin',
+    'administrator', 'login', 'test', 'dev', 'info', 'phpinfo', 'readme',
+    'changelog', 'license', 'todo', 'notes', 'old', 'new', 'temp', 'tmp',
+    'secret', 'secrets', 'credentials', 'creds', 'password', 'passwords',
+    'passwd', 'key', 'keys', 'private', 'server', 'web', 'site', 'error',
+    'access', 'debug', 'wp-config', 'connection', 'connect', 'env',
+    'docker-compose', 'composer', 'package', 'webpack', 'gulpfile',
+)
+
+# Extensions appended to FUZZ_FILE_STEMS. The first FUZZ_EXT_CORE entries are the
+# highest-signal (used in Stealth); the full list is used in Aggressive. Ordered
+# so a mode slice keeps the most valuable ones. Categorical: scripting, markup,
+# data, config, archive, backup, db, editor leftovers.
+FUZZ_EXTENSIONS = (
+    # core (Stealth) — scripting + markup + the classic leak archives/backups
+    '.php', '.html', '.txt', '.json', '.xml', '.bak', '.old', '.zip',
+    # medium (Normal) — more scripting/markup, data, config, db, archives
+    '.aspx', '.asp', '.jsp', '.htm', '.do', '.action', '.yml', '.yaml', '.csv',
+    '.ini', '.conf', '.config', '.cfg', '.env', '.sql', '.db', '.sqlite',
+    # aggressive — long-tail scripting, archives, backups, editor/VCS leftovers
+    '.php5', '.phtml', '.cgi', '.pl', '.py', '.rb', '.shtml', '.xhtml',
+    '.properties', '.toml', '.dump', '.mdb', '.tar', '.tar.gz', '.tgz', '.gz',
+    '.7z', '.rar', '.bak1', '.orig', '.save', '.swp', '~', '.tmp', '.log',
+    '.pem', '.key', '.crt', '.inc',
+)
+FUZZ_EXT_CORE = 8     # FUZZ_EXTENSIONS[:8] — Stealth
+FUZZ_EXT_MED  = 24    # FUZZ_EXTENSIONS[:24] — Normal
+
+# Common subdomain labels the Fuzzing scan type brute-forces against the
+# registrable domain (DNS resolution confirms each before it's reported), so the
+# fuzzer surfaces hosts the site never links to. Categorical (www/api/infra/
+# mail/dev/cloud/region), ordered so a mode slice keeps the highest-value names.
+SUBDOMAIN_WORDLIST = (
+    'www', 'api', 'app', 'admin', 'dev', 'test', 'staging', 'stage', 'mail',
+    'webmail', 'remote', 'vpn', 'ns1', 'ns2', 'smtp', 'pop', 'imap', 'm',
+    'mobile', 'portal', 'dashboard', 'cpanel', 'whm', 'autodiscover', 'cdn',
+    'static', 'assets', 'img', 'images', 'media', 'files', 'download', 'upload',
+    'docs', 'support', 'help', 'status', 'blog', 'shop', 'store', 'secure',
+    'login', 'auth', 'sso', 'account', 'accounts', 'my', 'beta', 'demo', 'qa',
+    'uat', 'sandbox', 'internal', 'intranet', 'corp', 'git', 'gitlab', 'jenkins',
+    'jira', 'confluence', 'ci', 'build', 'registry', 'docker', 'k8s',
+    'kubernetes', 'grafana', 'kibana', 'prometheus', 'monitor', 'monitoring',
+    'metrics', 'log', 'logs', 'elk', 'db', 'database', 'mysql', 'postgres',
+    'redis', 'mongo', 'sql', 'backup', 'old', 'new', 'legacy', 'archive', 'web',
+    'web1', 'web2', 'server', 'host', 'gateway', 'gw', 'proxy', 'lb', 'edge',
+    'origin', 'api1', 'api2', 'apiv1', 'apiv2', 'rest', 'graphql', 'ws',
+    'socket', 'push', 'notify', 'events', 'analytics', 'track', 'ads', 'pay',
+    'payment', 'payments', 'billing', 'checkout', 'order', 'crm', 'erp', 'hr',
+    'wiki', 'forum', 'community', 'news', 'careers', 'jobs', 'partner',
+    'partners', 'client', 'clients', 'customer', 'cloud', 'aws', 'azure', 'gcp',
+    's3', 'storage', 'cache', 'queue', 'mq', 'broker', 'auth2', 'id', 'identity',
+    'oauth', 'idp', 'ldap', 'ad', 'dns', 'ftp', 'sftp', 'ssh', 'rdp', 'phpmyadmin',
+)
+SUBDOMAIN_BRUTE_N = {'Stealth': 30, 'Normal': 80, 'Aggressive': len(SUBDOMAIN_WORDLIST)}
+
 SCAN_MODES = {
     'Stealth': {
         'page_delay':     (1.5, 4.0),
@@ -3011,7 +3350,8 @@ class scan:
                  username='', password='', browser_geometry='', mode=None,
                  scope_pattern='', on_subdomain=None, subdomain_discovery=True,
                  auth_scan=False, auth_callback=None, host_auth=None,
-                 whitelist=None, scan_type='browser', proxy=None, unsafe=False):
+                 whitelist=None, scan_type='browser', proxy=None, unsafe=False,
+                 unsafe_cb=None):
         """Configure a scan run.
 
         Args:
@@ -3064,14 +3404,17 @@ class scan:
         # None = auto-probe every non-destructive non-GET path (no whitelist).
         self.whitelist  = whitelist
         # Proxy ('host:port') the browser routes through so its traffic is
-        # intercepted; None = direct. Unsafe mode (intercept-driven full-surface
-        # crawl): when True the crawl interacts with EVERYTHING — no whitelist, no
-        # destructive veto, no safe-click gating — so the user can vet each request
-        # in the interceptor. Scope (_in_scope) still applies.
+        # intercepted; None = direct. UNSAFE mode (intercept-driven full-surface
+        # crawl): when on, the crawl interacts with EVERYTHING — no whitelist, no
+        # destructive veto, no safe-click gating — like a user filling every field
+        # and clicking every control; the user vets each request in the
+        # interceptor. Scope (_in_scope) still applies. `unsafe` is read LIVE from
+        # `unsafe_cb` (the proxy's intercept state) so toggling the proxy mid-scan
+        # flips the crawl between full-surface (proxy on) and safe/heuristic (off);
+        # the whitelist is kept (not nulled) so it re-applies when the proxy is off.
         self.proxy   = proxy or None
-        self.unsafe  = bool(unsafe)
-        if self.unsafe:
-            self.whitelist = None
+        self._unsafe_static = bool(unsafe)
+        self._unsafe_cb     = unsafe_cb
         self.auth_callback = auth_callback
         # host -> credential descriptor {'type': str, ...fields}. Shared dict so
         # the app can pre-seed it and sub-scans reuse credentials entered once.
@@ -3098,6 +3441,13 @@ class scan:
         m = SCAN_MODES[self.mode]
         self.max_clicks   = m['max_clicks']
         self.max_assets   = m['max_assets']
+        # The Fuzzing scan type is pure content discovery (pages/files/APIs), so
+        # it needs a much larger probe budget than a browser crawl. `assets` is
+        # only an in-memory dedup set of attempted URLs (the graph still gets just
+        # the hits), so a high cap is cheap; it scales with the intensity mode.
+        if self.scan_type == 'fuzzing':
+            self.max_assets = {'Stealth': 1200, 'Normal': 6000,
+                               'Aggressive': 12000}.get(self.mode, 6000)
         self._page_delay  = m['page_delay']
         self._mode_quiet  = m['ready_quiet']
         self._mode_hard_cap = m['ready_hard_cap']
@@ -3463,6 +3813,43 @@ class scan:
             if not self.running and self.driver is not None:
                 break
             self._note_subdomain(host)
+
+    def _fuzz_subdomains(self):
+        """Fuzzing scan type's subdomain discovery: passive certificate-
+        transparency (crt.sh, all modes — a single passive request) plus an active
+        DNS brute-force of SUBDOMAIN_WORDLIST against the registrable domain, with
+        breadth scaled by the intensity mode. Each host that resolves and is in
+        scope is reported via _note_subdomain → the app spawns a Fuzzing sub-scan
+        for it (so every discovered subdomain is itself fuzzed). Best-effort; runs
+        once on the primary scan only (sub-scans set subdomain_discovery=False)."""
+        if not (self.subdomain_discovery and self.on_subdomain):
+            return
+        base = self.base_domain
+        if not base:
+            return
+        # Passive recon first — one HTTP request, cheap and quiet enough for any
+        # mode (Stealth is passive-only, and this is passive).
+        try:
+            self._enumerate_subdomains_crtsh()
+        except Exception:
+            pass
+        # Active DNS brute-force, mode-scaled. Resolution confirms the host exists
+        # so we don't spawn scans against dead names.
+        import socket
+        limit = SUBDOMAIN_BRUTE_N.get(self.mode, 80)
+        self._log(f'Fuzz ({self.mode}): {limit} subdomain candidates on {base}')
+        for word in SUBDOMAIN_WORDLIST[:limit]:
+            if not self.running:
+                break
+            host = f'{word}.{base}'
+            if host == self._entry_host or host in self.subs_seen:
+                continue
+            try:
+                socket.getaddrinfo(host, None)
+            except Exception:
+                continue                       # doesn't resolve — skip
+            self._throttle()                   # respect the mode's pacing
+            self._note_subdomain(host)         # scope-checked inside
 
     def _collect_api_calls(self, domain) -> list:
         """Real requests the page made, read from the fetch/XHR instrumentation:
@@ -3966,11 +4353,27 @@ class scan:
         if self.on_node:
             self.on_node(node)
 
+    @property
+    def unsafe(self) -> bool:
+        """Live full-surface flag. Reads `unsafe_cb` (the proxy's intercept state)
+        each time so toggling the proxy mid-scan flips the crawl between
+        full-surface (proxy ON) and safe/heuristic (proxy OFF); falls back to the
+        value fixed at scan start when no callback is wired."""
+        cb = self._unsafe_cb
+        if cb is not None:
+            try:
+                return bool(cb())
+            except Exception:
+                pass
+        return self._unsafe_static
+
     def _interaction_allowed(self, url) -> bool:
-        """Whether a state-changing interaction with `url` is permitted by the
-        safe-path whitelist (control clicks, form submits, non-GET requests).
-        Always True when no whitelist is configured. Passive GET navigation is
-        never gated by this."""
+        """Whether a state-changing interaction with `url` is permitted. UNSAFE
+        (proxy on) → always allowed (full surface). Otherwise gated by the
+        safe-path whitelist; always True when no whitelist is configured. Passive
+        GET navigation is never gated by this."""
+        if self.unsafe:
+            return True
         wl = self.whitelist
         if wl is None or not getattr(wl, 'enabled', False):
             return True
@@ -4047,6 +4450,14 @@ class scan:
         '.nav-tabs a', 'th[role="columnheader"]', 'thead th', '.sortable',
         '.el-table__header-wrapper th', '.caret-wrapper', '.sort-caret',
         '.pagination li', '.el-pagination button', '.el-pager li',
+    )
+    # UNSAFE (proxy on) extra controls — every button/submit/checkbox/radio a
+    # user would press, with no destructive-label filtering (links are followed
+    # by the normal crawl, so they aren't re-clicked here).
+    _UNSAFE_SELECTORS = (
+        'button', 'input[type="submit"]', 'input[type="button"]',
+        'input[type="checkbox"]', 'input[type="radio"]', '[role="button"]',
+        'summary', '[onclick]',
     )
     # Inputs to fill with a probe value: only search-like fields (avoids
     # submitting create/edit forms).
@@ -4239,11 +4650,17 @@ class scan:
         except Exception:
             pass
 
-        # 1) Fill + submit visible search-like inputs.
+        # 1) Fill visible text inputs. SAFE mode: only search-like fields (avoids
+        #    submitting create/edit forms). UNSAFE (proxy on): EVERY text field,
+        #    like a user typing into the whole page.
+        sel_inputs = (
+            'input[type="search"], input[type="text"], input[type="email"], '
+            'input[type="tel"], input[type="url"], input[type="number"], '
+            'input[type="password"], input:not([type]), textarea'
+            if self.unsafe else
+            'input[type="search"], input[type="text"], input:not([type])')
         try:
-            inputs = self.driver.find_elements(
-                By.CSS_SELECTOR,
-                'input[type="search"], input[type="text"], input:not([type])')
+            inputs = self.driver.find_elements(By.CSS_SELECTOR, sel_inputs)
         except Exception:
             inputs = []
         for el in inputs:
@@ -4256,10 +4673,11 @@ class scan:
                     el.get_attribute('name'), el.get_attribute('id'),
                     el.get_attribute('placeholder'), el.get_attribute('type'),
                     el.get_attribute('aria-label')])).lower()
-                is_search = (el.get_attribute('type') == 'search'
-                             or any(h in attrs for h in self._SEARCH_HINTS))
-                if not is_search or 'password' in attrs:
-                    continue
+                if not self.unsafe:
+                    is_search = (el.get_attribute('type') == 'search'
+                                 or any(h in attrs for h in self._SEARCH_HINTS))
+                    if not is_search or 'password' in attrs:
+                        continue
                 before = self.driver.current_url
                 el.clear()
                 el.send_keys(self._SEARCH_PROBE)
@@ -4276,10 +4694,13 @@ class scan:
             except Exception:
                 continue
 
-        # 2) Click non-destructive controls (re-querying each time, since clicks
-        #    mutate the DOM). Skip labels that look like state changes.
+        # 2) Click controls (re-querying each time, since clicks mutate the DOM).
+        #    SAFE mode skips state-changing labels; UNSAFE adds every button/
+        #    submit/checkbox and clicks them all (no destructive filtering).
+        click_selectors = (self._INTERACT_SELECTORS + self._UNSAFE_SELECTORS
+                           if self.unsafe else self._INTERACT_SELECTORS)
         seen = set()
-        for sel in self._INTERACT_SELECTORS:
+        for sel in click_selectors:
             if budget <= 0 or not self.running:
                 break
             try:
@@ -5024,12 +5445,30 @@ class scan:
             return True
         return bool(cls._path_tokens(url) & cls._UNSAFE_POST_PATH)
 
+    # Static / data / archive / backup file extensions. A path ending in one of
+    # these is a file to download, not an action verb — so GETting it has no side
+    # effect even when its name contains a word like 'backup'/'export'/'import'.
+    # Executable script extensions (.php/.asp/.jsp/.cgi/…) are deliberately absent:
+    # e.g. /backup.php could *run* a backup, so it stays gated.
+    _STATIC_FILE_EXTS = (
+        '.txt', '.html', '.htm', '.xhtml', '.json', '.xml', '.yml', '.yaml',
+        '.csv', '.ini', '.conf', '.config', '.cfg', '.env', '.properties',
+        '.toml', '.sql', '.db', '.sqlite', '.mdb', '.dump', '.zip', '.tar',
+        '.tar.gz', '.tgz', '.gz', '.7z', '.rar', '.bak', '.bak1', '.old',
+        '.orig', '.save', '.swp', '.tmp', '.log', '.pem', '.key', '.crt',
+        '.inc', '.md', '.pdf', '.gz',
+    )
+
     @classmethod
     def _is_unsafe_get(cls, url) -> bool:
         """True if auto-GETting this path could have a side effect (session-kill,
         credential side effect, destructive / job-trigger op). Used to seed such
         an endpoint un-sent rather than requesting it — GET is only *nominally*
-        safe; real apps execute these on GET."""
+        safe; real apps execute these on GET. A path ending in a static file
+        extension is exempt: it names a file to download, not an action."""
+        last = (urlparse(url).path or '').rsplit('/', 1)[-1].lower()
+        if last.endswith(cls._STATIC_FILE_EXTS):
+            return False
         return bool(cls._path_tokens(url) & cls._UNSAFE_GET_PATH)
 
     @classmethod
@@ -5390,14 +5829,42 @@ class scan:
 
     def _is_spa_fallback(self, node: SiteNode) -> bool:
         """True if a response looks like the app's HTML shell / a route fallback
-        rather than a real data endpoint (generic across frameworks)."""
+        rather than a real data endpoint (generic across frameworks).
+
+        For API discovery, ANY HTML is treated as the shell (an endpoint should
+        return data, not a page). The Fuzzing scan type is the exception: its whole
+        job is to surface files/pages, so HTML is kept — only responses matching
+        the learned catch-all soft-404 shell (`shell_hash`, set by `_learn_soft404`)
+        are dropped, so real distinct pages like /admin/ survive while a 200-for-
+        everything SPA still doesn't flood the graph."""
         ct = (node.content_type or '').lower()
-        if ct.startswith('text/html') or ct.startswith('application/xhtml'):
+        is_html = ct.startswith('text/html') or ct.startswith('application/xhtml')
+        if is_html and self.scan_type != 'fuzzing':
             return True
         if self.shell_hash and node.resp_body and \
                 self._sig(node.resp_body) == self.shell_hash:
             return True
         return False
+
+    def _learn_soft404(self, base_url):
+        """Fuzzing baseline: probe a guaranteed-nonexistent path to see whether the
+        server answers unknown URLs with a catch-all 200 'shell' (SPA soft-404). If
+        so, record its signature as `shell_hash` so fuzzing drops only pages
+        identical to it and keeps real, distinct pages. No node is emitted; a true
+        404 leaves `shell_hash` None (the server distinguishes missing paths)."""
+        if self.shell_hash is not None or not REQUESTS_AVAILABLE:
+            return
+        rnd = uuid.uuid4().hex[:16]
+        probe = urljoin(base_url, f'/{rnd}-doesnotexist-{rnd}')
+        node = SiteNode(probe, node_type='page', parent_url=None)
+        try:
+            self._capture_http(node, probe)
+        except Exception:
+            return
+        if node.resp_status == 200 and node.resp_body:
+            self.shell_hash = self._sig(node.resp_body)
+            self._log('Fuzz: catch-all soft-404 shell detected — distinct pages '
+                      'still kept, shell duplicates dropped.')
 
     # Response Content-Types that mark a node as a downloadable file / media
     # asset rather than a real (data-returning) API. Used to relabel an 'endpoint'
@@ -5626,14 +6093,22 @@ class scan:
     # server that keeps naming new required fields can't loop indefinitely.
     _MAX_BODY_ROUNDS = 4
 
-    def _probe_get(self, url, parent_url):
+    def _probe_get(self, url, parent_url, confirmed=True):
         """Send one safe GET probe for an endpoint-discovery candidate. If the
         response proves the path exists, create + emit a node and return it;
         otherwise return None. Drops only 404/410/501 and the SPA HTML shell
         (catch-all routes). 401/403 and every other status are KEPT — the status
-        and body are exactly what the user wants to see and analyse."""
+        and body are exactly what the user wants to see and analyse.
+
+        `confirmed` marks paths that are actually disclosed by the site (links,
+        specs, robots.txt/sitemap) vs blind wordlist guesses. A blind guess at a
+        destructive-looking GET path can be neither sent (side effects) nor
+        confirmed, so it is skipped rather than seeded as a speculative node —
+        disclosed destructive paths still get surfaced un-sent for review."""
         norm = self._norm(url)
         if norm in self.visited or norm in self.assets:
+            return None
+        if not confirmed and self._is_unsafe_get(url):
             return None
         self.assets.add(norm)
         node = SiteNode(url, node_type='endpoint', parent_url=parent_url)
@@ -5715,32 +6190,125 @@ class scan:
             self.on_node(node)
         return node
 
+    def _base_is_live(self, url) -> bool:
+        """Lightweight existence check for an API base, INDEPENDENT of the probe
+        dedup set (`assets`) — so a base an earlier step already probed (e.g. the
+        well-known pass hits '/api/') is still evaluated instead of looking dead.
+        Sends one throwaway GET; True unless it 404s or returns the SPA shell. No
+        node is emitted and `assets` is untouched."""
+        node = SiteNode(url, node_type='endpoint', parent_url=None)
+        try:
+            self._capture_http(node, url)
+        except Exception:
+            return False
+        st = node.resp_status
+        if st is None or st in (404, 410, 501):
+            return False
+        return not self._is_spa_fallback(node)
+
+    def _probe_common_files(self, domain, fire):
+        """Probe the common static / metadata / exposure files (robots.txt,
+        sitemap.xml, .git/HEAD, …) a directory fuzzer should always check, then
+        mine robots.txt (Disallow/Allow/Sitemap) and any sitemap (<loc>) for the
+        further same-host paths they disclose and fire those too. `fire(path)`
+        emits one bounded GET probe and returns its node (or None)."""
+        for path in COMMON_FILES:
+            node = fire(path)
+            if node is None or not getattr(node, 'resp_body', ''):
+                continue
+            low_url = node.url.lower()
+            if low_url.rstrip('/').endswith('robots.txt'):
+                self._mine_robots(node, domain, fire)
+            elif 'sitemap' in low_url and low_url.endswith('.xml'):
+                self._mine_sitemap(node, domain, fire, depth=1)
+
+    def _mine_robots(self, node, domain, fire):
+        """Fire the paths a robots.txt discloses (Disallow/Allow) and recurse into
+        any `Sitemap:` URLs it points at (same host, bounded)."""
+        paths, sitemaps, seen = [], [], set()
+        for line in (node.resp_body or '').splitlines()[:2000]:
+            line = line.split('#', 1)[0].strip()
+            low = line.lower()
+            if low.startswith(('disallow:', 'allow:')):
+                p = line.split(':', 1)[1].strip()
+                if p and p.startswith('/') and p not in ('/',) \
+                        and '*' not in p and p not in seen:
+                    seen.add(p)
+                    paths.append(p)
+            elif low.startswith('sitemap:'):
+                sm = line.split(':', 1)[1].strip()
+                if sm:
+                    sitemaps.append(sm)
+        for p in paths[:50]:
+            if not self.running:
+                break
+            fire(p)
+        for sm in sitemaps[:5]:
+            if urlparse(sm).netloc not in ('', domain):
+                continue
+            n = fire(sm)
+            if n is not None and getattr(n, 'resp_body', ''):
+                self._mine_sitemap(n, domain, fire, depth=1)
+
+    def _mine_sitemap(self, node, domain, fire, depth=1):
+        """Fire same-host URLs listed in a sitemap's <loc> entries (bounded). A
+        <sitemapindex> recurses one level into its child sitemaps."""
+        body = node.resp_body or ''
+        is_index = '<sitemapindex' in body.lower()
+        count = 0
+        for loc in re.findall(r'<loc>\s*(.*?)\s*</loc>', body, re.I | re.S):
+            if not self.running or count >= 80:
+                break
+            loc = loc.strip()
+            if not loc or urlparse(loc).netloc not in ('', domain):
+                continue
+            n = fire(loc)
+            count += 1
+            if is_index and depth > 0 and n is not None \
+                    and getattr(n, 'resp_body', ''):
+                self._mine_sitemap(n, domain, fire, depth - 1)
+
     def _probe_api_endpoints(self, domain, parent_url):
-        """Active, unauthenticated endpoint discovery, run once per host after the
-        crawl (so the SPA shell signature is known). Normal: high-signal spec /
-        discovery / well-known paths only. Aggressive (or any mode with the Auto
-        Fuzzer on): + a comprehensive path wordlist, expanded ONLY under API
-        bases that exist (a 404 base is skipped) to keep volume and WAF exposure
-        bounded. Skipped in Stealth unless the Auto Fuzzer is on (gated by the
-        caller). A swagger/openapi hit is mined for its full endpoint list."""
+        """Active, unauthenticated content discovery — the engine of the Fuzzing
+        scan type (the Browser scanner never calls this; it only navigates). Probes
+        common/metadata files (robots/sitemap, mined for more paths), high-signal
+        spec/well-known paths, then a comprehensive directory/file/API wordlist —
+        all scope-gated, with breadth and probe budget scaled by the intensity
+        mode (Stealth quiet, Aggressive wide). A swagger/openapi hit is mined for
+        its full endpoint list."""
         if not self.running or not REQUESTS_AVAILABLE:
             return
         base_root = f'{urlparse(parent_url).scheme or "https"}://{domain}/'
         probes = 0
+        # The Fuzzing scan type is a dedicated content-discovery sweep, so it gets
+        # a far larger probe budget than a browser-side API probe, scaled by the
+        # intensity mode (Stealth stays quiet, Aggressive goes wide).
+        max_probes = ({'Stealth': 1000, 'Normal': 5000, 'Aggressive': 10000}
+                      .get(self.mode, 5000)
+                      if self.scan_type == 'fuzzing' else self._MAX_PROBES)
 
-        def fire(path):
+        def fire(path, confirmed=True):
             """Probe one path under the host root, honouring the probe budget,
-            asset cap and stealth throttle. Returns the created node or None."""
+            asset cap and stealth throttle. `confirmed=False` marks a blind
+            wordlist guess (a destructive-looking one is then skipped, not seeded).
+            Returns the created node or None."""
             nonlocal probes
-            if (not self.running or probes >= self._MAX_PROBES
+            if (not self.running or probes >= max_probes
                     or len(self.assets) >= self.max_assets):
+                return None
+            full = urljoin(base_root, str(path).lstrip('/'))
+            if not self._in_scope(full):       # honour the user's scope
                 return None
             probes += 1
             self._throttle()
-            return self._probe_get(urljoin(base_root, str(path).lstrip('/')),
-                                   parent_url)
+            return self._probe_get(full, parent_url, confirmed=confirmed)
 
         self._log(f'API probe ({self.mode}): {domain}')
+        # 0) Common static / metadata / exposure files (all modes) — robots.txt,
+        #    sitemap.xml, and friends, which the endpoint wordlist alone misses.
+        #    robots.txt and any sitemap are then mined for the further paths they
+        #    disclose, so the fuzzer finds the most files in every mode.
+        self._probe_common_files(domain, fire)
         # 1) High-signal well-known / spec / discovery paths (Normal + Aggressive).
         for path in API_PROBE_WELLKNOWN:
             node = fire(path)
@@ -5764,24 +6332,51 @@ class scan:
                         if urlparse(ep).netloc == domain:
                             fire(ep)
         # 2) Wordlist fuzzing — Aggressive, or any intensity in the Fuzzing scan
-        #    type — under bases that actually exist. Discovers directories/
-        #    endpoints that nothing links to (e.g. /images, /admin). Paced by the
+        #    type. Content discovery for things nothing links to: directories /
+        #    pages (FUZZ_DIRS), files by stem×extension (FUZZ_FILE_STEMS), and API
+        #    resources under live API bases (API_PROBE_WORDLIST). Paced by the
         #    mode's throttle (slow in Stealth), bounded by probe budget/asset cap.
         if self.scan_type == 'fuzzing' or self.mode == 'Aggressive':
-            self._log(f'Fuzz ({self.mode}): path wordlist '
-                      f'({len(API_PROBE_WORDLIST)} words)')
-            live_bases = []
+            # 2a) Detect which API bases actually exist FIRST, via a dedup-
+            #     independent liveness check (an earlier step may already have
+            #     probed '/api/', which would otherwise make fire() see it as a
+            #     dead duplicate and skip its whole wordlist).
+            live_bases = ['/']
             for b in API_PROBE_BASES:
-                if b == '/':
-                    live_bases.append(b)
+                if b == '/' or probes >= max_probes:
                     continue
-                if fire(b) is not None:
+                probes += 1
+                self._throttle()
+                if self._base_is_live(urljoin(base_root, b.lstrip('/'))):
                     live_bases.append(b)
+            # 2b) Directory / page names at the web root (e.g. /admin, /backup).
+            self._log(f'Fuzz ({self.mode}): {len(FUZZ_DIRS)} dirs/pages')
+            for d in FUZZ_DIRS:
+                if not self.running or probes >= max_probes:
+                    break
+                fire('/' + d, confirmed=False)         # blind guess
+            # 2c) Files: common stems × extensions at the root (config.php,
+            #     backup.zip, db.sql, …). Extension breadth scales with the mode.
+            exts = (FUZZ_EXTENSIONS[:FUZZ_EXT_CORE] if self.mode == 'Stealth'
+                    else FUZZ_EXTENSIONS if self.mode == 'Aggressive'
+                    else FUZZ_EXTENSIONS[:FUZZ_EXT_MED])
+            self._log(f'Fuzz ({self.mode}): {len(FUZZ_FILE_STEMS)} file stems '
+                      f'× {len(exts)} extensions')
+            for stem in FUZZ_FILE_STEMS:
+                if not self.running or probes >= max_probes:
+                    break
+                for ext in exts:
+                    if not self.running or probes >= max_probes:
+                        break
+                    fire('/' + stem + ext, confirmed=False)
+            # 2d) API resource wordlist under the live bases found in 2a.
+            self._log(f'Fuzz ({self.mode}): API wordlist '
+                      f'({len(API_PROBE_WORDLIST)} words)')
             for b in live_bases:
                 for word in API_PROBE_WORDLIST:
-                    if not self.running or probes >= self._MAX_PROBES:
+                    if not self.running or probes >= max_probes:
                         break
-                    fire(b + word)
+                    fire(b + word, confirmed=False)   # blind guess
         # 3) Relocate source-mined relative API paths under each detected base
         #    (Normal + Aggressive). The frontend writes calls relative to axios's
         #    baseURL (e.g. '/hosts/command/search' under '/api/v1'), so resolving
@@ -6422,16 +7017,12 @@ class scan:
                 except Exception as e:
                     self._log(f'Error: {url[:50]} -> {e}')
 
-            # Active API-endpoint discovery, once per host after the crawl (the
-            # SPA shell signature is known by now, so catch-all 200s are dropped).
-            # Normal: high-signal spec/well-known probes; Aggressive: + wordlist
-            # fuzzing. Skipped in Stealth (low-noise by design). (Pure fuzzing
-            # runs via _run_fuzz instead, without the browser crawl.)
-            if self.running and self.mode != 'Stealth':
-                try:
-                    self._probe_api_endpoints(domain, target)
-                except Exception as e:
-                    self._log(f'API probe error: {e}')
+            # The Browser scanner NAVIGATES only — it crawls, clicks and interacts
+            # via Selenium and discovers endpoints from the pages/JS/traffic it
+            # actually loads (_discover_assets). It does NOT brute-force or guess
+            # paths: all active path/file/API/subdomain fuzzing lives in the
+            # Fuzzing scan type (_run_fuzz). Run a Fuzzing scan on the same target
+            # to add those findings to this same graph.
 
         except Exception as e:
             self.failed = True
@@ -6462,10 +7053,12 @@ class scan:
                 self.on_done()
 
     def _run_fuzz(self, target):
-        """Fuzzing scan type: no browser. Establish an entrance node for `target`
-        then run the path-wordlist fuzzing pass under the host, emitting every
-        hit. Uses requests directly (no Selenium) and is paced by the intensity
-        mode's throttle. The whitelist does not apply (GET path discovery only)."""
+        """Fuzzing scan type: no browser. Fuzz EVERYTHING a fuzzer can — pages,
+        files (stem×extension), directories, API endpoints, common/metadata files
+        (robots/sitemap, mined for more paths) AND subdomains (passive crt.sh +
+        active DNS brute, which spawn their own Fuzzing sub-scans). Uses requests
+        directly (no Selenium), honours the scope, and is paced/scaled by the
+        intensity mode. The whitelist does not apply (GET path discovery only)."""
         if not REQUESTS_AVAILABLE:
             self._log('Fuzzing needs requests: pip install requests')
             return
@@ -6485,7 +7078,16 @@ class scan:
         self.assets.add(self._norm(target))   # don't re-probe the entrance
         if self.on_node:
             self.on_node(root)
-        # Path-wordlist + well-known fuzzing under the host root.
+        # Learn the catch-all soft-404 shell (if any) so HTML pages can be kept
+        # without a 200-for-everything SPA flooding the graph.
+        self._learn_soft404(target)
+        # Subdomain fuzzing (primary scan only — sub-scans set
+        # subdomain_discovery=False): passive crt.sh + active DNS brute, each
+        # discovered host spawning its own Fuzzing sub-scan. Runs in the
+        # background so the host's own content fuzzing proceeds in parallel.
+        if self.running and self.subdomain_discovery and self.on_subdomain:
+            threading.Thread(target=self._fuzz_subdomains, daemon=True).start()
+        # Path / file / directory / API wordlist fuzzing under the host root.
         if self.running:
             self._probe_api_endpoints(domain, target)
 
@@ -7070,6 +7672,27 @@ def _merlin_hat_photo(target_px=18):
         return None
 
 
+def _scrying_orb_photo(target_px=18):
+    """The scrying-orb icon (reconner-icons/scrying-orb.png) as a Tk image sized to
+    target_px, or None if it can't be loaded. Requires a Tk root."""
+    path = os.path.join(_node_icon_dir(), 'scrying-orb.png')
+    if not os.path.isfile(path):
+        return None
+    try:
+        from PIL import Image, ImageTk
+        im = Image.open(path).convert('RGBA').resize(
+            (target_px, target_px), Image.LANCZOS)
+        return ImageTk.PhotoImage(im)
+    except Exception:
+        pass
+    try:
+        img = tk.PhotoImage(file=path)
+        f = max(1, round(img.width() / target_px))
+        return img.subsample(f, f)
+    except Exception:
+        return None
+
+
 # ─────────────────────────────────────────────
 # Panel 1 – Graph
 # ─────────────────────────────────────────────
@@ -7199,26 +7822,25 @@ class GraphPanel(tk.Frame):
         if self.on_load_json:
             menu.add_separator()
             menu.add_command(label='Load scan JSON…', command=self.on_load_json)
-        menu_btn.config(menu=menu)
-        menu_btn.pack(side='left', padx=2)
-        self._options_menu = menu
-
-        # Per-type visibility filters (one checkbox per node type).
-        filt_btn = tk.Menubutton(ctrl, text='Filter ▾', bg=C['btn'],
-                                 activebackground=C['btn'], relief='raised',
-                                 bd=2, font=C['font'], padx=6, highlightthickness=0)
-        fmenu = tk.Menu(filt_btn, tearoff=0, bg=C['btn'], fg=C['black'],
+        # Per-type visibility filters — now a 'Filter' submenu OF Options
+        # (one checkbox per node type).
+        fmenu = tk.Menu(menu, tearoff=0, bg=C['btn'], fg=C['black'],
                         activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
                         font=C['font'])
         for label in ('page', 'file', 'redirect', 'script', 'endpoint', 'shell'):
             var = tk.BooleanVar(value=True)
             self.type_vars[label] = var
             fmenu.add_checkbutton(label=label, variable=var, command=self._redraw)
-        filt_btn.config(menu=fmenu)
-        filt_btn.pack(side='left', padx=2)
+        menu.add_separator()
+        menu.add_cascade(label='Filter', menu=fmenu)
+        menu_btn.config(menu=menu)
+        menu_btn.pack(side='right', padx=2)   # Options sits top-right of the bar
+        self._options_menu = menu
         self._filter_menu = fmenu
+        # Hover-driven open/close for the Options tree (recurses into Filter) and
+        # the Subdomains dropdown.
         self._arm_ctx_dismiss(self._options_menu)
-        self._arm_ctx_dismiss(self._filter_menu)
+        arm_menu_autoclose(self._subdomain_menu, self)
 
         # The tree itself (single column; the implicit tree column shows the
         # arrow + icon + name).
@@ -7234,6 +7856,7 @@ class GraphPanel(tk.Frame):
         hsb.grid(row=1, column=0, sticky='ew')
         self.tree.config(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.tree.bind('<<TreeviewSelect>>', self._on_tree_select)
+        self.tree.bind('<Button-1>', self._on_tree_click, add='+')
         self.tree.bind('<Button-3>', self._on_right_click)
         self.tree.bind('<Escape>', self._deselect)
 
@@ -7664,6 +8287,12 @@ class GraphPanel(tk.Frame):
         if self.on_select and url in self.nodes:
             self.on_select(self.nodes[url])
 
+    def _on_tree_click(self, ev):
+        """Left-clicking empty space (not on a node row) clears the selection —
+        the row bindings handle clicks that land on an actual node."""
+        if not self.tree.identify_row(ev.y):
+            self._deselect()
+
     def _deselect(self, *_):
         """Clear the current selection and notify the app."""
         sel = self.tree.selection()
@@ -7702,8 +8331,6 @@ class GraphPanel(tk.Frame):
                     font=C['font'])
         if getattr(self, '_options_menu', None) is not None:
             m.add_cascade(label='Options', menu=self._options_menu)
-        if getattr(self, '_filter_menu', None) is not None:
-            m.add_cascade(label='Filter', menu=self._filter_menu)
         self._arm_ctx_dismiss(m)
         return m
 
@@ -7720,11 +8347,8 @@ class GraphPanel(tk.Frame):
         m = tk.Menu(self, tearoff=0, bg=C['btn'], fg=C['black'],
                     activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
                     font=C['font'])
-        m.add_command(label='Analyze with AI', command=info._ai_analyze)
-        m.add_command(label='Open in Browser', command=info._open_in_browser)
-        m.add_separator()
-        m.add_command(label='Repeater', command=info._open_repeater)
-        m.add_command(label='Fuzzer', command=info._open_fuzzer)
+        m.add_command(label='Send to Repeater', command=info._open_repeater)
+        m.add_command(label='Send to Fuzzer', command=info._open_fuzzer)
         m.add_separator()
         m.add_command(label='Set Shell', command=info._set_shell)
         m.add_command(label='Open Shell', command=info._open_shell,
@@ -7738,10 +8362,11 @@ class GraphPanel(tk.Frame):
         return m
 
     def _arm_ctx_dismiss(self, menu):
-        """Make `menu` part of the right-click auto-dismiss: leaving it arms a
-        short close timer; re-entering any armed menu cancels it."""
-        menu.bind('<Enter>', lambda _e: self._cancel_menu_dismiss(), add='+')
-        menu.bind('<Leave>', lambda _e: self._schedule_menu_dismiss(), add='+')
+        """Give `menu` (a right-click context menu or the Options dropdown) the same
+        hover-driven open/close behaviour as every other menu: suboptions open on
+        hover, stepping back to a parent closes its submenus, and the tree closes
+        once the pointer is outside every box."""
+        arm_menu_autoclose(menu, self)
 
     def _schedule_menu_dismiss(self):
         """Arm the deferred dismiss of the current context menu."""
@@ -7802,9 +8427,9 @@ class GraphPanel(tk.Frame):
 # ─────────────────────────────────────────────
 class InfoPanel(tk.Frame):
     """The node-inspector panel: shows the selected SiteNode's URL, metadata,
-    parameters, request/response and AI insight, and hosts the Analyze-with-AI,
-    Repeater and Fuzzer actions. `on_new_node` reports nodes the Repeater/Fuzzer
-    create back to the application."""
+    parameters and request/response, and hosts the Repeater and Fuzzer actions.
+    (AI analysis lives in the Wizard's "Analyze Node".) `on_new_node` reports
+    nodes the Repeater/Fuzzer create back to the application."""
     def __init__(self, parent, ai: "ollama", on_new_node=None,
                  on_create_shell=None, **kw):
         """Store the AI client and callbacks, then build the widgets.
@@ -7845,9 +8470,6 @@ class InfoPanel(tk.Frame):
         menu = tk.Menu(opt_btn, tearoff=0, bg=C['btn'], fg=C['black'],
                        activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
                        font=C['font'])
-        menu.add_command(label='Analyze with AI', command=self._ai_analyze)
-        menu.add_command(label='Open in Browser', command=self._open_in_browser)
-        menu.add_separator()
         menu.add_command(label='Send to Repeater', command=self._open_repeater)
         menu.add_command(label='Send to Fuzzer', command=self._open_fuzzer)
         menu.add_separator()
@@ -7857,6 +8479,16 @@ class InfoPanel(tk.Frame):
         menu.add_command(label='Open Shell', command=self._open_shell,
                          state='disabled')
         self._open_shell_idx = menu.index('end')
+        # Encode / Decode cascades over the node's selected text (Content / Req /
+        # Resp boxes).
+        menu.add_separator()
+        build_codec_submenus(
+            menu, lambda: [self.content_txt, self.req_txt, self.resp_txt], self)
+        build_sign_submenu(
+            menu, lambda: [self.content_txt, self.req_txt, self.resp_txt], self)
+        build_crack_submenu(
+            menu, lambda: [self.content_txt, self.req_txt, self.resp_txt], self)
+        arm_menu_autoclose(menu, self)        # close on pointer-leave
         opt_btn.config(menu=menu)
         opt_btn.pack(side='left', fill='y')   # fill the placed (19px) height
         self._opt_menu = menu
@@ -7927,12 +8559,8 @@ class InfoPanel(tk.Frame):
         tk.Label(resp_col, text='Response:', bg=C['bg'], font=C['font_b']).pack(anchor='w')
         sf, self.resp_txt = self._scrolled_text(resp_col)
         sf.pack(fill='both', expand=True, pady=(2, 0))
-
-        # Tab: AI Insight
-        self.t_ai = tk.Frame(nb, bg=C['bg'])
-        nb.add(self.t_ai, text='AI Insight')
-        af, self.ai_txt = self._scrolled_text(self.t_ai, wrap='word')
-        af.pack(fill='both', expand=True, padx=2, pady=2)
+        # Right-click anywhere in the inspector opens the same Options menu.
+        bind_rightclick_menu(self, self._opt_menu)
 
     def _scrolled_text(self, parent, **kw):
         """Read-only Text95 with a vertical scrollbar; adds a horizontal
@@ -7983,12 +8611,6 @@ class InfoPanel(tk.Frame):
         self.content_txt.set_content(body)
         self.req_txt.set_content(self._fmt_request(node))
         self.resp_txt.set_content(self._fmt_response(node))
-        if node.ai_insight:
-            self.ai_txt.set_content(node.ai_insight)
-        elif node.ai_running:
-            self.ai_txt.set_content('Analyzing… please wait.')
-        else:
-            self.ai_txt.set_content('Click "Analyze with AI" for security insights.')
 
     def clear(self):
         """Reset the inspector to its empty state (no node selected)."""
@@ -7998,8 +8620,7 @@ class InfoPanel(tk.Frame):
             self.ov_vars[k].set('')
         self.links_lb.delete(0, 'end')
         for txt, msg in ((self.content_txt, 'No node selected.'),
-                         (self.req_txt, ''), (self.resp_txt, ''),
-                         (self.ai_txt, 'Select a node and click "Analyze with AI".')):
+                         (self.req_txt, ''), (self.resp_txt, '')):
             txt.set_content(msg)
 
     @staticmethod
@@ -8049,43 +8670,6 @@ class InfoPanel(tk.Frame):
         lines.append(InfoPanel._pretty_body(node.resp_body) if node.resp_body
                      else '(empty body)')
         return '\n'.join(lines)
-
-    def _ai_analyze(self):
-        """Run an AI analysis of the selected node on a background thread and show
-        the result in the AI tab; the insight is cached on the node."""
-        if not self.node:
-            messagebox.showinfo('No Node', 'Select a node in the graph first.')
-            return
-        node = self.node
-        self.nb.select(self.t_ai)
-        if node.ai_running:
-            self.ai_txt.set_content('Analyzing… please wait.')
-            return
-        self.ai_txt.set_content('Analyzing… please wait.')
-        node.ai_running = True
-
-        def run():
-            """Worker: analyse the node, store the result on it, and refresh the
-            widget only if that node is still the one on screen."""
-            insight = self.ai.analyze_node(node)
-            node.ai_insight = insight
-            node.ai_running = False
-            def update():
-                """Update the AI text on the UI thread if `node` is still shown."""
-                if self.node is node:
-                    self.ai_txt.set_content(insight)
-            try:
-                self.after(0, update)
-            except Exception:
-                pass
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _open_in_browser(self):
-        """Open the selected node's URL in the system web browser."""
-        if not self.node or not self.node.url:
-            return
-        webbrowser.open(self.node.url, new=2)
 
     def _open_repeater(self):
         """Open the Repeater dialog seeded with the selected node's request."""
@@ -8158,7 +8742,6 @@ class SettingsDialog(ModalToplevel):
 
         self.title('Settings')
         self.configure(bg=C['bg'])
-        self.resizable(False, False)
 
         # Buttons first so the OK/Apply/Cancel bar is reserved at the bottom
         # before the notebook claims the remaining space: the dialog has a fixed
@@ -8196,16 +8779,10 @@ class SettingsDialog(ModalToplevel):
 
         tk.Label(page, text='AI Model:', bg=C['bg'], font=C['font_b'],
                  anchor='w', width=14).grid(row=0, column=0, sticky='w', pady=6)
-        self._model_var = tk.StringVar(value=self.settings.get('model', 'reconner-ai'))
-        Entry95(page, textvariable=self._model_var).grid(
-            row=0, column=1, sticky='ew', padx=(6, 0), pady=6)
-
-        tk.Label(page, text='Wizard Model:', bg=C['bg'], font=C['font_b'],
-                 anchor='w', width=14).grid(row=1, column=0, sticky='w', pady=6)
         self._wizard_model_var = tk.StringVar(
             value=self.settings.get('wizard_model', 'wizard-ai'))
         Entry95(page, textvariable=self._wizard_model_var).grid(
-            row=1, column=1, sticky='ew', padx=(6, 0), pady=6)
+            row=0, column=1, sticky='ew', padx=(6, 0), pady=6)
 
         tk.Label(page, text='Ollama Host:', bg=C['bg'], font=C['font_b'],
                  anchor='w', width=14).grid(row=2, column=0, sticky='w', pady=6)
@@ -8250,7 +8827,7 @@ class SettingsDialog(ModalToplevel):
             command=self._clear_wizard_memory).pack(side='left', padx=(8, 0))
 
     def _clear_wizard_chat(self):
-        """Delete the Wizard's raw chat-history log (~/.wizard-ai/conversation.json)."""
+        """Delete the Wizard's raw chat-history log (~/.reconner/conversation.json)."""
         if not messagebox.askyesno(
                 'Clear chat history',
                 "Delete the Wizard's saved chat history?\n"
@@ -8262,7 +8839,7 @@ class SettingsDialog(ModalToplevel):
             self.on_clear_wizard_chat()
 
     def _clear_wizard_memory(self):
-        """Delete the Wizard's distilled AI memory (~/.wizard-ai/memory.md)."""
+        """Delete the Wizard's distilled AI memory (~/.reconner/memory.md)."""
         if not messagebox.askyesno(
                 'Clear AI memory',
                 "Erase the Wizard's distilled memory of earlier findings?\n"
@@ -8547,7 +9124,7 @@ class SettingsDialog(ModalToplevel):
             ('Selenium', SELENIUM_AVAILABLE), ('Ollama', OLLAMA_AVAILABLE),
             ('bs4', BS4_AVAILABLE), ('requests', REQUESTS_AVAILABLE)] if ok) or 'none'
         row(0, 'Ollama host:', self.settings.get('ollama_host', 'http://localhost:11434'))
-        row(1, 'Model:',       self.settings.get('model', 'reconner-ai'))
+        row(1, 'Model:',       self.settings.get('wizard_model', 'wizard-ai'))
         row(2, 'Theme:',       'Chicago95')
         row(3, 'Installed:',   deps)
 
@@ -8563,7 +9140,6 @@ class SettingsDialog(ModalToplevel):
     def _gather(self) -> dict:
         """Collect the current widget values into a settings dict."""
         s = dict(self.settings)
-        s['model']       = self._model_var.get().strip() or 'reconner-ai'
         s['wizard_model'] = self._wizard_model_var.get().strip() or 'wizard-ai'
         s['ollama_host'] = self._host_var.get().strip().rstrip('/')
         s['temperature'] = round(float(self._temp_var.get()), 2)
@@ -8618,20 +9194,17 @@ class SettingsDialog(ModalToplevel):
 # Tech fingerprint dialog
 # ─────────────────────────────────────────────
 class FingerprintDialog(ModalToplevel):
-    """Popup that shows a raw technology fingerprint of a target and an AI
-    analysis of it. The caller is responsible for caching: this widget just
-    displays whatever it's handed via set_fingerprint / set_ai."""
+    """Popup that shows a raw technology fingerprint of a target. The caller is
+    responsible for caching: this widget just displays whatever it's handed via
+    set_fingerprint. (AI analysis lives in the Wizard's "Analyze Tech".)"""
 
-    def __init__(self, parent, target, on_analyze, on_select=None):
+    def __init__(self, parent, target, on_select=None):
         """Build the dialog for `target`.
 
-        on_analyze() asks the app to start/show the AI analysis (the app owns the
-        run + cache so it survives this popup closing). on_select(target_url) asks
-        the app to load that host's tech scan into this popup (each discovered
-        subdomain has its own fingerprint)."""
+        on_select(target_url) asks the app to load that host's tech scan into this
+        popup (each discovered subdomain has its own fingerprint)."""
         super().__init__(parent)
         self.target = target
-        self.on_analyze = on_analyze
         self.on_select = on_select
 
         self.title(f'Tech Scan — {target}')
@@ -8666,22 +9239,12 @@ class FingerprintDialog(ModalToplevel):
         self.fp_txt.pack(side='left', fill='both', expand=True)
         fp_sb.pack(side='right', fill='y')
 
-        # The tech scan now runs as part of the target scan, so this dialog is a
-        # passive viewer — the only action is the AI analysis of the result.
-        bar = tk.Frame(wrap, bg=C['bg'])
-        bar.pack(fill='x', pady=(0, 6))
-        self.ai_btn = Btn(bar, text='Analyze with AI', command=self._do_analyze)
-        self.ai_btn.pack(side='left')
-
-        tk.Label(wrap, text='AI analysis:', bg=C['bg'],
-                 font=C['font_b']).pack(anchor='w')
-        ai_frame = tk.Frame(wrap, bg=C['bg'])
-        ai_frame.pack(fill='both', expand=True, pady=(2, 0))
-        self.ai_txt = Text95(ai_frame, wrap='word', height=12)
-        ai_sb = tk.Scrollbar(ai_frame, orient='vertical', command=self.ai_txt.yview)
-        self.ai_txt.config(yscrollcommand=ai_sb.set)
-        self.ai_txt.pack(side='left', fill='both', expand=True)
-        ai_sb.pack(side='right', fill='y')
+        # The tech scan runs as part of the target scan, so this dialog is a
+        # passive viewer. To analyse the result, open the Wizard and use
+        # "Analyze Tech" (wizard-ai), which can target this host or all of them.
+        tk.Label(wrap, text='Tip: open the Wizard and use "Analyze Tech" to get '
+                 'an AI breakdown of this fingerprint.', bg=C['bg'], fg=C['black'],
+                 font=C['font'], anchor='w').pack(anchor='w', pady=(2, 4))
 
         self.update_idletasks()
         px = parent.winfo_rootx() + parent.winfo_width() // 2 - 360
@@ -8709,16 +9272,6 @@ class FingerprintDialog(ModalToplevel):
     def set_fingerprint(self, text: str):
         """Show `text` in the fingerprint pane."""
         self.fp_txt.set_content(text)
-
-    def set_ai(self, text: str):
-        """Show `text` in the AI-analysis pane."""
-        self.ai_txt.set_content(text)
-
-    def _do_analyze(self):
-        """Request the AI analysis from the app (which owns the run so it
-        survives this popup closing), if a fingerprint is present."""
-        if self.fp_txt.get('1.0', 'end').strip():
-            self.on_analyze()
 
 
 # ─────────────────────────────────────────────
@@ -8818,15 +9371,15 @@ class RequestEditorDialog(ModalToplevel):
     as a new node via `on_save`."""
     def __init__(self, parent, node: SiteNode, on_save=None):
         """Build the Repeater for `node` with the Data In / Data Out views."""
-        super().__init__(parent)
+        super().__init__(parent, modal=False)   # non-blocking: leave other windows usable
         self.node = node
         self.on_save = on_save
         self._has_response = False
         self._do_has_response = False
+        self._last_resp_in = None       # last requests.Response (Data In / Out)
+        self._last_resp_out = None       # — for Options ▸ Show Images
         self._do_base_url = node.url
         self._do_sel_raw = None
-        self._enc_vars = make_encode_vars()      # URL / Base64 / Hex (one at a time)
-        self._enc_mode = encode_mode_getter(self._enc_vars)
         self.title(f'Repeater — {node.url[:80]}')
         self.configure(bg=C['bg'])
 
@@ -8838,16 +9391,11 @@ class RequestEditorDialog(ModalToplevel):
         self.view_var = tk.StringVar(value='in')
         sel = tk.Frame(wrap, bg=C['bg'])
         sel.pack(fill='x', pady=(0, 6))
-        tk.Radiobutton(
-            sel, text='Input  (request that fetched this page + its response)',
-            variable=self.view_var, value='in', command=self._switch_view,
-            bg=C['bg'], activebackground=C['bg'], selectcolor=C['window'],
-            highlightthickness=0, font=C['font']).pack(side='left')
-        tk.Radiobutton(
-            sel, text='Output  (requests this page can use)',
-            variable=self.view_var, value='out', command=self._switch_view,
-            bg=C['bg'], activebackground=C['bg'], selectcolor=C['window'],
-            highlightthickness=0, font=C['font']).pack(side='left', padx=(12, 0))
+        exclusive_checks(
+            sel, self.view_var,
+            [('in', 'Input  (request that fetched this page + its response)'),
+             ('out', 'Output  (requests this page can use)')],
+            command=self._switch_view, padx=(0, 12))
 
         # Stack: one frame per view, swapped by _switch_view().
         self.stack = tk.Frame(wrap, bg=C['bg'])
@@ -8858,8 +9406,6 @@ class RequestEditorDialog(ModalToplevel):
         cont, self.req_txt, self.body_txt, self.resp_txt, self.resp_body_txt = \
             _build_req_resp_fixed(self.in_frame)
         cont.pack(fill='both', expand=True)
-        _bind_encode(self.req_txt, self._enc_mode)
-        _bind_encode(self.body_txt, self._enc_mode)
         bar = tk.Frame(self.in_frame, bg=C['bg'])
         bar.pack(fill='x', pady=(6, 0))
         self.send_btn = Btn(bar, text='  Send  ', command=self._send,
@@ -8870,7 +9416,12 @@ class RequestEditorDialog(ModalToplevel):
         self.save_btn = Btn(bar, text='Save as New Node',
                             command=self._save_as_node, state='disabled')
         self.save_btn.pack(side='left', padx=6)
-        build_encode_checks(bar, self._enc_vars, suffix='typing', side='right')
+        # Top-right: Encode / Decode of the highlighted selection (Base64 / Hex /
+        # URL / Octal), shown in a popup.
+        self._codec_btn = build_codec_menus(
+            bar, lambda: [self.req_txt, self.body_txt,
+                          self.resp_txt, self.resp_body_txt], side='right',
+            show_images_cb=lambda: self._show_images('in'))
 
         # ── Data Out view: list (top 2/3) of requests the node can use, one per
         #    line with horizontal scroll; selecting one loads it into the editor
@@ -8913,13 +9464,13 @@ class RequestEditorDialog(ModalToplevel):
         self.do_save_btn = Btn(dobar, text='Save as New Node',
                                command=self._do_save, state='disabled')
         self.do_save_btn.pack(side='left', padx=6)
-        # Same shared encode vars as the Data In bar, so the two stay in sync.
-        build_encode_checks(dobar, self._enc_vars, suffix='typing', side='right')
+        self._codec_btn2 = build_codec_menus(
+            dobar, lambda: [self.do_req_txt, self.do_body_txt,
+                            self.do_resp_txt, self.do_resp_body_txt], side='right',
+            show_images_cb=lambda: self._show_images('out'))
         docont, self.do_req_txt, self.do_body_txt, self.do_resp_txt, \
             self.do_resp_body_txt = _build_req_resp_fixed(ea)
         docont.pack(side='top', fill='both', expand=True)
-        _bind_encode(self.do_req_txt, self._enc_mode)
-        _bind_encode(self.do_body_txt, self._enc_mode)
 
         # Populate the Data Out list, one request per line.
         self._do_items = []
@@ -8947,6 +9498,11 @@ class RequestEditorDialog(ModalToplevel):
         px = parent.winfo_rootx() + parent.winfo_width() // 2 - 480
         py = parent.winfo_rooty() + parent.winfo_height() // 2 - 360
         self.geometry(f'960x720+{max(px, 0)}+{max(py, 0)}')
+        # Right-click anywhere opens the same Options menu (per editor region; the
+        # Data Out subtree is bound first so it keeps its own menu).
+        bind_rightclick_menu(self.out_frame, self._codec_btn2.codec_menu)
+        bind_rightclick_menu(self.in_frame, self._codec_btn.codec_menu)
+        bind_rightclick_menu(self, self._codec_btn.codec_menu)
 
     def _switch_view(self):
         """Show the Data In or Data Out frame per the radio selection."""
@@ -9035,9 +9591,11 @@ class RequestEditorDialog(ModalToplevel):
         self.send_btn.config(state='disabled')
         self.save_btn.config(state='disabled')
 
+        base = self.node.req_url or self.node.url
+
         def run():
             """Worker: send the raw request and update the response pane."""
-            r, text = send_raw_request(raw, self.node.req_url or self.node.url)
+            r, text = send_raw_request(raw, base)
             if not self.winfo_exists():
                 return
             got = r is not None
@@ -9046,11 +9604,27 @@ class RequestEditorDialog(ModalToplevel):
                 _set_split(self.resp_txt, self.resp_body_txt, text)
                 self.send_btn.config(state='normal')
                 self._has_response = got
+                self._last_resp_in = r
                 self.save_btn.config(
                     state=('normal' if got and self.on_save else 'disabled'))
+                if got:                     # log the send into the proxy history
+                    record_history(raw, base, r, text, 'repeater')
             self.after(0, update)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _show_images(self, which):
+        """Render any images in the last response of the given editor ('in' Data
+        In / 'out' Data Out) — Options ▸ Show Images."""
+        if which == 'out':
+            r, txtw = self._last_resp_out, self.do_resp_body_txt
+        else:
+            r, txtw = self._last_resp_in, self.resp_body_txt
+        if r is None:
+            messagebox.showinfo('Show Images', 'Send the request first.')
+            return
+        show_images_popup(self, r.headers.get('Content-Type', ''),
+                          r.content, txtw.get('1.0', 'end-1c'))
 
     def _save_as_node(self):
         """Save the current Data-In request/response as a new edited node."""
@@ -9125,8 +9699,11 @@ class RequestEditorDialog(ModalToplevel):
                 _set_split(self.do_resp_txt, self.do_resp_body_txt, text)
                 self.do_send_btn.config(state='normal')
                 self._do_has_response = got
+                self._last_resp_out = r
                 self.do_save_btn.config(
                     state=('normal' if got and self.on_save else 'disabled'))
+                if got:                     # log the send into the proxy history
+                    record_history(raw, base, r, text, 'repeater')
             self.after(0, update)
 
         threading.Thread(target=run, daemon=True).start()
@@ -9167,18 +9744,15 @@ class FuzzerDialog(ModalToplevel):
     def __init__(self, parent, node: SiteNode, on_save=None):
         """Build the Fuzzer for `node`: request template, payload positions,
         attack mode, match/filter inputs and the results table."""
-        super().__init__(parent)
+        super().__init__(parent, modal=False)   # non-blocking: leave other windows usable
         self.node = node
         self.on_save = on_save
         self.results: list[tuple[str, int, int, str, str]] = []
         self._running = False
         self._stop_requested = False
-        # Encode-typing (request/body) and encode-payloads — each URL/Base64/Hex,
-        # one active at a time.
-        self._enc_vars = make_encode_vars()
-        self._enc_mode = encode_mode_getter(self._enc_vars)
-        self._pl_enc_vars = make_encode_vars()
-        self._pl_enc_mode = encode_mode_getter(self._pl_enc_vars)
+        # Per-position payload encoding, set via the Encode dropdown when a
+        # {{FUZZn}} marker is in the selection: position number -> coding kind.
+        self.pos_enc: dict[int, str] = {}
 
         self.title(f'Fuzzer — {node.url[:80]}')
         self.configure(bg=C['bg'])
@@ -9192,7 +9766,11 @@ class FuzzerDialog(ModalToplevel):
         tk.Label(rlab,
                  text='Request (mark positions with  {{FUZZ1}} {{FUZZ2}} … ):',
                  bg=C['bg'], font=C['font_b']).pack(side='left')
-        build_encode_checks(rlab, self._enc_vars, suffix='typing', side='right')
+        # Top-right: the Options ▾ menu (Encode/Decode workbench, Sign, Crack, Show
+        # Images).
+        self._codec_btn = build_codec_menus(
+            rlab, lambda: [self.req_txt, self.body_txt],
+            side='right', show_images_cb=self._show_images)
         rf = tk.Frame(wrap, bg=C['bg'])
         rf.pack(fill='both', expand=True, pady=(2, 4))
         self.req_txt = EditText95(rf, height=8)
@@ -9200,7 +9778,6 @@ class FuzzerDialog(ModalToplevel):
         self.req_txt.config(yscrollcommand=rsb.set)
         self.req_txt.pack(side='left', fill='both', expand=True)
         rsb.pack(side='right', fill='y')
-        _bind_encode(self.req_txt, self._enc_mode)
 
         # Dedicated body editor — sent verbatim as the request body. {{FUZZn}}
         # positions may be placed here too (e.g. to fuzz a value in the body).
@@ -9213,7 +9790,6 @@ class FuzzerDialog(ModalToplevel):
         self.body_txt.config(yscrollcommand=bsb.set)
         self.body_txt.pack(side='left', fill='both', expand=True)
         bsb.pack(side='right', fill='y')
-        _bind_encode(self.body_txt, self._enc_mode)
 
         # ── Middle: fuzz positions + per-position payloads ──────────────
         # Multiple positions are supported: mark them in the request with
@@ -9232,14 +9808,8 @@ class FuzzerDialog(ModalToplevel):
         self.pos_label = tk.Label(ptop, text='Payloads (one per line):',
                                   bg=C['bg'], font=C['font_b'])
         self.pos_label.pack(side='left')
-        # Encode each payload (URL / Base64 / Hex, one at a time) before it's
-        # substituted into the request — applies whether typed or loaded from a
-        # wordlist file.
-        build_encode_checks(ptop, self._pl_enc_vars, suffix='payloads', side='left')
         Btn(ptop, text='Insert position',
             command=self._insert_marker).pack(side='right', padx=2)
-        Btn(ptop, text='Load Wordlist',
-            command=self._load_wordlist).pack(side='right', padx=2)
         Btn(ptop, text='Clear',
             command=self._clear_payloads).pack(side='right', padx=2)
 
@@ -9260,6 +9830,10 @@ class FuzzerDialog(ModalToplevel):
         self.pos_btn.pack(side='left', padx=(4, 0))
         Btn(psel, text='Refresh',
             command=self._refresh_positions).pack(side='left', padx=6)
+        # Load a wordlist into the active position's payloads — lives with the
+        # payloads panel (just above the payloads editor).
+        Btn(psel, text='Load Wordlist',
+            command=self._load_wordlist).pack(side='right', padx=2)
         tk.Label(psel, text='Mode:', bg=C['bg'],
                  font=C['font']).pack(side='left', padx=(8, 2))
         self.mode_btn = tk.Menubutton(psel, text=self.mode_var.get() + ' ▾',
@@ -9379,6 +9953,8 @@ class FuzzerDialog(ModalToplevel):
         px = parent.winfo_rootx() + parent.winfo_width() // 2 - 540
         py = parent.winfo_rooty() + parent.winfo_height() // 2 - 400
         self.geometry(f'1080x800+{max(px, 0)}+{max(py, 0)}')
+        # Right-click anywhere in the Fuzzer opens the same Options menu.
+        bind_rightclick_menu(self, self._codec_btn.codec_menu)
 
     # ── results listbox ─────────────────────────────────────────────
     def _add_header_row(self):
@@ -9407,6 +9983,24 @@ class FuzzerDialog(ModalToplevel):
                 state=('normal' if self.on_save else 'disabled'))
         else:
             self.save_btn.config(state='disabled')
+
+    def _show_images(self):
+        """Render any images in the selected result's response — Options ▸ Show
+        Images. The Fuzzer keeps responses as text, so the whole-body image is
+        recovered from the text (plus any data: URIs)."""
+        idxs = self.results_lb.curselection()
+        i = (idxs[0] - 1) if idxs else -1
+        if not (0 <= i < len(self.results)):
+            messagebox.showinfo('Show Images', 'Select a result row first.')
+            return
+        raw = self.results[i][3]
+        parsed = parse_raw_response(raw)
+        if parsed:
+            _st, _rs, resp_headers, body = parsed
+            ctype = (resp_headers or {}).get('Content-Type', '')
+        else:
+            ctype, body = '', raw
+        show_images_popup(self, ctype, None, body)
 
     def _save_selected(self):
         """Save the selected result (its sent request + captured response) as an
@@ -9627,7 +10221,9 @@ class FuzzerDialog(ModalToplevel):
             return
 
         self._clear_results()
-        wizard_react('fuzzer')         # Fuzzer run → Wizard casts or scries (random)
+        # Fuzz start → Wizard holds a sustained "working" anim (scry/processing/
+        # held magic, random); 'fuzzer_done' (in finish()) releases it.
+        wizard_react('fuzzer')
         self._running = True
         self._stop_requested = False
         self.start_btn.config(state='disabled')
@@ -9640,7 +10236,9 @@ class FuzzerDialog(ModalToplevel):
         ms = _make_int_matcher(self.ms_var.get())
         fc = _make_int_matcher(self.fc_var.get())
         fs = _make_int_matcher(self.fs_var.get())
-        payload_mode = self._pl_enc_mode()      # '' / 'url' / 'base64' / 'hex'
+        # Per-position payload encoding (set via the Encode dropdown). Captured
+        # now so the worker thread reads a stable copy.
+        pos_enc = dict(self.pos_enc)
         marker_sets = [self._marker_strings(n) for n in positions]
 
         def worker():
@@ -9652,8 +10250,8 @@ class FuzzerDialog(ModalToplevel):
                 if not self._running or not self.winfo_exists():
                     break
                 raw_req = template
-                for marks, payload in zip(marker_sets, combo):
-                    value = _encode_value(payload, payload_mode)
+                for pos, marks, payload in zip(positions, marker_sets, combo):
+                    value = _encode_value(payload, pos_enc.get(pos, ''))
                     for mk in marks:
                         raw_req = raw_req.replace(mk, value)
                 r, raw = send_raw_request(raw_req, base)
@@ -9671,16 +10269,23 @@ class FuzzerDialog(ModalToplevel):
                 entry = (shown, status, length, raw, raw_req)
                 self.results.append(entry)
 
-                def add(i=idx, p=shown, s=status, ln=length):
-                    """Append one result row to the listbox on the main thread."""
-                    if self.winfo_exists():
-                        self.results_lb.insert(
-                            'end',
-                            f'{i:>4}  {s:>6}  {ln:>7}  {p[:60]}')
+                def add(i=idx, p=shown, s=status, ln=length,
+                        rq=raw_req, rr=r, rt=raw):
+                    """Append one result row to the listbox and log the send into
+                    the proxy history (tagged 'F'), on the main thread."""
+                    if not self.winfo_exists():
+                        return
+                    self.results_lb.insert(
+                        'end',
+                        f'{i:>4}  {s:>6}  {ln:>7}  {p[:60]}')
+                    record_history(rq, base, rr, rt, 'fuzzer')
                 self.after(0, add)
 
             def finish(_sent=sent_any, _errs=errors):
                 """Reset the run UI and set the success/fail badge."""
+                # Release the Wizard's held fuzz animation (it's a separate window,
+                # so signal it even if this dialog was closed mid-run).
+                wizard_react('fuzzer_done')
                 if not self.winfo_exists():
                     return
                 self._running = False
@@ -10262,51 +10867,6 @@ class helper:
         return text
 
     @staticmethod
-    def _encode_keypress(event, mode_getter):
-        """`<Key>` handler for request editors: transform the typed character per
-        the active encoding mode returned by `mode_getter()` so a payload can be
-        typed in already-encoded form. Modes:
-          'url'    — percent-encode non-unreserved chars (A-Za-z0-9-_.~ pass through)
-          'hex'    — every char → its UTF-8 bytes as hex ('A' → 41, ' ' → 20)
-          'base64' — every char → base64 of its UTF-8 bytes (per character)
-          '' / None — pass through unchanged
-        Control keys (Enter/Tab/Backspace), control chars and Ctrl-shortcuts always
-        pass through. Returns 'break' when it inserts the encoded form so the
-        literal char isn't also inserted by Tk's default binding."""
-        try:
-            mode = mode_getter()
-            if not mode:
-                return None
-            ch = event.char
-            if not ch or len(ch) != 1:
-                return None
-            if event.state & 0x4:          # Ctrl held → shortcut, leave alone
-                return None
-            o = ord(ch)
-            if o < 0x20 or o == 0x7f:      # control char (Enter/Tab/…) passes
-                return None
-            if mode == 'url':
-                if ch.isascii() and (ch.isalnum() or ch in '-_.~'):
-                    return None
-                enc = quote(ch, safe='')
-            elif mode == 'hex':
-                enc = ch.encode('utf-8', 'replace').hex()
-            elif mode == 'base64':
-                enc = base64.b64encode(
-                    ch.encode('utf-8', 'replace')).decode('ascii')
-            else:
-                return None
-            event.widget.insert('insert', enc)
-            return 'break'
-        except Exception:
-            return None
-
-    @staticmethod
-    def _bind_encode(widget, mode_getter):
-        """Make `widget` auto-encode typed characters per `mode_getter()`."""
-        widget.bind('<Key>', lambda e: helper._encode_keypress(e, mode_getter))
-
-    @staticmethod
     def fingerprint_target(url: str, should_stop=None, mode=None) -> str:
         """Technology fingerprint, scoped by scan mode. HTTP header/body
         signatures always run; the remaining probes are gated by the mode's
@@ -10438,45 +10998,1312 @@ _passes_filters = helper._passes_filters
 compute_data_in = helper.compute_data_in
 compute_data_out = helper.compute_data_out
 format_data_out = helper.format_data_out
-_encode_keypress = helper._encode_keypress
-_bind_encode = helper._bind_encode
 _encode_value = helper._encode_value
 fingerprint_target = helper.fingerprint_target
 
 
-def make_encode_vars():
-    """Three BooleanVars backing the URL / Base64 / Hex encode-mode checkboxes."""
-    return {'url': tk.BooleanVar(value=False),
-            'base64': tk.BooleanVar(value=False),
-            'hex': tk.BooleanVar(value=False)}
+def exclusive_checks(parent, var, options, command=None, side='left',
+                     padx=(0, 8)):
+    """Mutually-exclusive CHECKBOXES backed by a shared StringVar — the app's style
+    in place of radio buttons. `options` = [(value, label), …]; clicking one
+    selects it (and can't be unchecked to empty: the click re-asserts the value).
+    Returns the list of checkbuttons."""
+    def pick(value):
+        var.set(value)
+        if command:
+            command()
+    cbs = []
+    for value, label in options:
+        cb = tk.Checkbutton(parent, text=label, variable=var,
+                            onvalue=value, offvalue='',
+                            command=lambda v=value: pick(v),
+                            bg=C['bg'], activebackground=C['bg'],
+                            selectcolor=C['window'], highlightthickness=0,
+                            font=C['font'])
+        cb.pack(side=side, padx=padx)
+        cbs.append(cb)
+    return cbs
 
 
-def encode_mode_getter(mvars):
-    """A callable returning the active mode ('url'/'base64'/'hex') or '' (none)."""
-    return lambda: next((m for m, v in mvars.items() if v.get()), '')
+def fill_dropdown(mb, options):
+    """(Re)populate a styled_dropdown's options; keeps the var's current value if
+    still valid else picks the first. The selected value is shown left with the ▾
+    pushed to the RIGHT border, and the menu entries are padded so the popup is the
+    same width as the button (combobox-like)."""
+    from tkinter import font as _tkfont
+    menu = mb._dd_menu
+    menu.delete(0, 'end')
+    f = _tkfont.Font(font=C['font'])
+    try:
+        w_chars = int(mb.cget('width')) or 0
+    except Exception:
+        w_chars = 0
+    if not w_chars:
+        w_chars = max((len(o) for o in options), default=1)
+    sp = max(1, f.measure(' '))
+    target = w_chars * f.measure('0')        # button inner width in px (approx)
+
+    def fmt_btn(v):
+        pad = max(1, (target - f.measure(v) - f.measure('▾')) // sp)
+        return v + ' ' * pad + '▾'
+
+    def menu_label(o):
+        return o + ' ' * max(0, (target - f.measure(o)) // sp)
+
+    def pick(v):
+        mb._dd_var.set(v)
+        mb.config(text=fmt_btn(v))
+        if mb._dd_command:
+            mb._dd_command(v)
+    for o in options:
+        menu.add_command(label=menu_label(o), command=lambda v=o: pick(v))
+    cur = mb._dd_var.get()
+    if cur not in options:
+        cur = options[0] if options else ''
+        mb._dd_var.set(cur)
+    mb.config(text=fmt_btn(cur))
 
 
-def build_encode_checks(parent, mvars, suffix='typing', side='right'):
-    """Pack three mutually-exclusive encode checkboxes (URL / Base64 / Hex) into
-    `parent`, sharing `mvars` (so multiple groups on the same vars stay in sync).
-    Checking one clears the others; all-off means no encoding. Visual order reads
-    URL · Base64 · Hex regardless of the pack side."""
-    def toggle(active):
-        if mvars[active].get():
-            for k, v in mvars.items():
-                if k != active:
-                    v.set(False)
-    order = [('url', f'URL-encode {suffix}'),
-             ('base64', f'Base64-encode {suffix}'),
-             ('hex', f'Hex-encode {suffix}')]
-    if side == 'right':
-        order = list(reversed(order))
-    for mode, text in order:
-        tk.Checkbutton(parent, text=text, variable=mvars[mode],
-                       command=lambda m=mode: toggle(m),
-                       bg=C['bg'], activebackground=C['bg'],
-                       selectcolor=C['window'], highlightthickness=0,
-                       font=C['font']).pack(side=side)
+def styled_dropdown(parent, var, options, command=None, width=None):
+    """An app-style dropdown (Menubutton + Menu, like the Options ▾ menus) bound to
+    StringVar `var`; `command(value)` fires on pick. `width` is in characters (size
+    it to the longest label so nothing crops). Repopulate via fill_dropdown()."""
+    mb = tk.Menubutton(parent, text='', bg=C['btn'], activebackground=C['btn'],
+                       relief='raised', bd=2, font=C['font'], padx=6,
+                       highlightthickness=0, anchor='w')
+    if width:
+        mb.config(width=width)
+    menu = tk.Menu(mb, tearoff=0, bg=C['btn'], fg=C['black'],
+                   activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
+                   font=C['font'])
+    mb.config(menu=menu)
+    mb._dd_menu, mb._dd_var, mb._dd_command = menu, var, command
+    fill_dropdown(mb, options)
+    arm_menu_autoclose(menu, mb)
+    return mb
+
+
+# ── Encode / Decode of a highlighted selection (Base64 / Hex / URL / Octal) ──
+_CODEC_KINDS = (('base64', 'Base64'), ('hex', 'Hexadecimal'),
+                ('url', 'URL'), ('octal', 'Octal'))
+
+
+def codec_encode(text, kind):
+    """Encode `text` (whole string) per `kind`: base64 / hex / url / octal."""
+    data = text.encode('utf-8', 'replace')
+    if kind == 'base64':
+        return base64.b64encode(data).decode('ascii')
+    if kind == 'hex':
+        return data.hex()
+    if kind == 'url':
+        return quote(text, safe='')
+    if kind == 'octal':
+        return ''.join('\\%03o' % b for b in data)
+    return text
+
+
+def codec_decode(text, kind):
+    """Decode `text` per `kind`, tolerant of common formats. Returns an error note
+    (not a raise) when the input isn't valid for the chosen coding."""
+    try:
+        if kind == 'base64':
+            s = re.sub(r'\s', '', text)
+            s += '=' * ((4 - len(s) % 4) % 4)
+            return base64.b64decode(s).decode('utf-8', 'replace')
+        if kind == 'hex':
+            h = re.sub(r'(?i)0x|\\x|%|\s', '', text)
+            return bytes.fromhex(h).decode('utf-8', 'replace')
+        if kind == 'url':
+            return unquote(text)
+        if kind == 'octal':
+            nums = re.findall(r'[0-7]{1,3}', text.replace('\\', ' '))
+            return bytes(int(n, 8) & 0xFF for n in nums).decode('utf-8', 'replace')
+    except Exception as e:
+        return '[decode error: %s]' % e
+    return text
+
+
+class _CodecDialog(tk.Toplevel):
+    """Encode / Decode workbench — no highlight required. Type or paste into the
+    Input box and the Output box updates live; Direction (Encode/Decode) and Coding
+    (Base64 / Hex / URL / Octal) are switchable, seeded from the menu choice and any
+    current text selection."""
+
+    _KEY_OF = {lbl: k for k, lbl in _CODEC_KINDS}
+    _LBL_OF = {k: lbl for k, lbl in _CODEC_KINDS}
+
+    def __init__(self, parent, kind, decode, initial=''):
+        super().__init__(bg=C['bg'])
+        self._dir = tk.StringVar(value='decode' if decode else 'encode')
+        self._kindlabel = tk.StringVar(value=self._LBL_OF.get(kind, kind))
+        try:
+            self.lift()          # normal (non-transient) window so it edge-tiles
+        except Exception:
+            pass
+        self._build(initial or '')
+        self._recompute()
+        self._retitle()
+        self.update_idletasks()
+        try:
+            self.geometry('+%d+%d' % (parent.winfo_rootx() + 40,
+                                      parent.winfo_rooty() + 40))
+        except Exception:
+            pass
+        remember_popup_geometry(self, 'CodecDialog')
+        self.bind('<Escape>', lambda _e: self.destroy())
+
+    def _retitle(self):
+        self.title('%s · %s' % ('Decode' if self._dir.get() == 'decode'
+                                else 'Encode', self._kindlabel.get()))
+
+    def _build(self, initial):
+        top = tk.Frame(self, bg=C['bg'])
+        top.pack(fill='x', padx=8, pady=(8, 2))
+        tk.Label(top, text='Direction:', bg=C['bg'],
+                 font=C['font_b']).pack(side='left')
+        exclusive_checks(top, self._dir,
+                         [('encode', 'Encode'), ('decode', 'Decode')],
+                         command=self._on_change, padx=(2, 0))
+        tk.Label(top, text='    Coding:', bg=C['bg'],
+                 font=C['font_b']).pack(side='left')
+        labels = [l for _k, l in _CODEC_KINDS]
+        styled_dropdown(top, self._kindlabel, labels,
+                        command=lambda _v: self._on_change(),
+                        width=max(len(l) for l in labels) + 3).pack(side='left',
+                                                                    padx=2)
+
+        tk.Label(self, text='Input:', bg=C['bg'], font=C['font_b'],
+                 anchor='w').pack(fill='x', padx=8)
+        self.inp = EditText95(self, width=64, height=7, wrap='char')
+        self.inp.pack(fill='both', expand=True, padx=8, pady=(0, 4))
+        if initial:
+            self.inp.set_content(initial)
+        self.inp.bind('<KeyRelease>', lambda _e: self._recompute())
+        self.inp.bind('<<Paste>>', lambda _e: self.after(1, self._recompute))
+
+        tk.Label(self, text='Output:', bg=C['bg'], font=C['font_b'],
+                 anchor='w').pack(fill='x', padx=8)
+        self.out = Text95(self, width=64, height=7, wrap='char')
+        self.out.pack(fill='both', expand=True, padx=8, pady=(0, 4))
+
+        bar = tk.Frame(self, bg=C['bg'])
+        bar.pack(fill='x', padx=8, pady=(0, 8))
+        Btn(bar, text=' Copy output ', command=self._copy).pack(side='right')
+
+    def _on_change(self):
+        self._retitle()
+        self._recompute()
+
+    def _recompute(self):
+        src = self.inp.get('1.0', 'end-1c')
+        fn = codec_decode if self._dir.get() == 'decode' else codec_encode
+        self.out.set_content(fn(src, self._KEY_OF.get(self._kindlabel.get())))
+
+    def _copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.out.get('1.0', 'end-1c'))
+
+
+def build_codec_submenus(menu, widgets, popup_parent):
+    """Add a single **Encode / Decode** command to `menu` — it opens the
+    Encode/Decode workbench (`_CodecDialog`) seeded with the current text selection
+    of `widgets`. The popup itself offers every direction + coding (Base64 / Hex /
+    URL / Octal), so there are no submenus."""
+    menu.add_command(
+        label='Encode / Decode',
+        command=lambda: _CodecDialog(popup_parent, 'base64', False,
+                                     initial=_menu_selection(widgets)))
+
+
+def build_codec_menus(parent, widgets, side='right', show_images_cb=None):
+    """A single **Options ▾** Menubutton whose menu holds the Encode/Decode
+    command over the selection of `widgets`, the Sign + Crack submenus, and — when
+    `show_images_cb` is given — a **Show Images** command. Returns the Menubutton."""
+    b = tk.Menubutton(parent, text='Options ▾', bg=C['btn'],
+                      activebackground=C['btn'], relief='raised', bd=2,
+                      font=C['font'], padx=6, highlightthickness=0)
+    m = tk.Menu(b, tearoff=0, bg=C['btn'], fg=C['black'],
+                activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
+                font=C['font'])
+    b.config(menu=m)
+    build_codec_submenus(m, widgets, parent)
+    build_sign_submenu(m, widgets, parent)
+    build_crack_submenu(m, widgets, parent)
+    if show_images_cb is not None:
+        m.add_separator()
+        m.add_command(label='Show Images', command=show_images_cb)
+    arm_menu_autoclose(m, b)          # close when the pointer leaves the dropdown
+    b.pack(side=side, padx=2)
+    b.codec_menu = m                  # exposed so panels can post it on right-click
+    return b
+
+
+# ─────────────────────────────────────────────
+# Response image rendering — "Show Images" decodes any images in a response body
+# (the body itself when it is an image, plus embedded data: URIs) and shows them.
+# ─────────────────────────────────────────────
+_IMAGE_MAGIC = (b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'GIF87a', b'GIF89a',
+                b'BM', b'\x00\x00\x01\x00')
+
+
+def _looks_like_image(data):
+    if not data:
+        return False
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return True
+    return any(data.startswith(sig) for sig in _IMAGE_MAGIC)
+
+
+def extract_response_images(ctype, body_bytes, body_text):
+    """Return [(label, PIL.Image), …] for a response: the whole body when it is an
+    image, plus every embedded `data:image/…;base64,…` URI in the text. `body_bytes`
+    may be None — then an image Content-Type falls back to recovering bytes from the
+    text (works when it was decoded byte-preservingly)."""
+    try:
+        from PIL import Image
+    except Exception:
+        return []
+    import io
+    out = []
+    ct = (ctype or '').split(';')[0].strip().lower()
+    data = body_bytes or b''
+    if not data and ct.startswith('image/') and body_text:
+        data = body_text.encode('latin-1', 'ignore')
+    if data and (ct.startswith('image/') or _looks_like_image(data)):
+        try:
+            out.append((ct or 'image', Image.open(io.BytesIO(data))))
+        except Exception:
+            pass
+    for m in re.finditer(r'data:image/[\w.+-]+;base64,([A-Za-z0-9+/=\s]+)',
+                         body_text or ''):
+        try:
+            raw = base64.b64decode(re.sub(r'\s', '', m.group(1)))
+            out.append(('data: URI', Image.open(io.BytesIO(raw))))
+        except Exception:
+            continue
+    return out
+
+
+def show_images_popup(parent, ctype, body_bytes, body_text,
+                      title='Response Images'):
+    """Render the images in a response (see extract_response_images) in a scrollable
+    popup; a friendly note if there are none."""
+    imgs = extract_response_images(ctype, body_bytes, body_text)
+    if not imgs:
+        messagebox.showinfo('Show Images', 'No images found in this response.')
+        return
+    try:
+        from PIL import ImageTk
+    except Exception:
+        messagebox.showerror('Show Images', 'Pillow (PIL) is required.')
+        return
+    top = tk.Toplevel(parent, bg=C['bg'])
+    top.title(title)
+    try:
+        top.lift()
+    except Exception:
+        pass
+    cv = tk.Canvas(top, bg=C['window'], highlightthickness=0)
+    vsb = tk.Scrollbar(top, orient='vertical', command=cv.yview)
+    cv.config(yscrollcommand=vsb.set)
+    vsb.pack(side='right', fill='y')
+    cv.pack(side='left', fill='both', expand=True)
+    inner = tk.Frame(cv, bg=C['window'])
+    cv.create_window((0, 0), window=inner, anchor='nw')
+    top._photos = []                      # keep PhotoImage refs alive
+    for label, im in imgs:
+        w, h = im.size
+        disp = im.convert('RGBA')
+        scale = min(1.0, 620.0 / max(1, w))
+        if scale < 1.0:
+            disp = disp.resize((int(w * scale), int(h * scale)))
+        ph = ImageTk.PhotoImage(disp)
+        top._photos.append(ph)
+        tk.Label(inner, text='%s — %d×%d' % (label, w, h), bg=C['window'],
+                 fg=C['black'], font=C['font'], anchor='w').pack(
+                     fill='x', padx=6, pady=(8, 0))
+        tk.Label(inner, image=ph, bg=C['window'],
+                 relief='sunken', bd=1).pack(padx=6, pady=(0, 6), anchor='w')
+    inner.update_idletasks()
+    cv.config(scrollregion=cv.bbox('all'))
+    for seq, d in (('<MouseWheel>', None), ('<Button-4>', -1), ('<Button-5>', 1)):
+        cv.bind(seq, (lambda e: cv.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
+                if d is None else (lambda e, d=d: cv.yview_scroll(d, 'units')))
+    remember_popup_geometry(top, 'ImageViewer', default_size=(700, 540))
+    top.bind('<Escape>', lambda _e: top.destroy())
+
+
+# ─────────────────────────────────────────────
+# Token signing — forge JWT / RFC 9421 / DPoP / SXG / HMAC-webhook signatures for
+# authorised testing (alg confusion, key confusion, alg:none, weak secrets…). Real
+# cryptographic signing via `cryptography` (RSA / ECDSA / EdDSA) + hmac/hashlib.
+# ─────────────────────────────────────────────
+try:
+    from cryptography.hazmat.primitives import hashes as _ch_hashes
+    from cryptography.hazmat.primitives import serialization as _ch_ser
+    from cryptography.hazmat.primitives.asymmetric import (
+        rsa as _ch_rsa, ec as _ch_ec, ed25519 as _ch_ed, padding as _ch_pad)
+    from cryptography.hazmat.primitives.asymmetric.utils import (
+        decode_dss_signature as _ch_decode_dss)
+    _HAVE_CRYPTO = True
+except Exception:
+    _HAVE_CRYPTO = False
+
+import hmac as _hmaclib
+
+# alg label -> (crypto kind, hash name).  Shared by JWT and DPoP (both are JWS).
+_JWS_ALG_SPEC = {
+    'HS256': ('hmac', 'sha256'), 'HS384': ('hmac', 'sha384'),
+    'HS512': ('hmac', 'sha512'),
+    'RS256': ('rsa-pkcs1', 'sha256'), 'RS384': ('rsa-pkcs1', 'sha384'),
+    'RS512': ('rsa-pkcs1', 'sha512'),
+    'PS256': ('rsa-pss', 'sha256'), 'PS384': ('rsa-pss', 'sha384'),
+    'PS512': ('rsa-pss', 'sha512'),
+    'ES256': ('ecdsa-p256', 'sha256'), 'ES384': ('ecdsa-p384', 'sha384'),
+    'ES512': ('ecdsa-p521', 'sha512'), 'ES256K': ('ecdsa-secp256k1', 'sha256'),
+    'EdDSA': ('ed25519', None), 'none': ('none', None),
+}
+_RFC9421_ALG_SPEC = {
+    'hmac-sha256': ('hmac', 'sha256'),
+    'rsa-pss-sha512': ('rsa-pss', 'sha512'),
+    'rsa-v1_5-sha256': ('rsa-pkcs1', 'sha256'),
+    'ecdsa-p256-sha256': ('ecdsa-p256', 'sha256'),
+    'ecdsa-p384-sha384': ('ecdsa-p384', 'sha384'),
+    'ed25519': ('ed25519', None),
+}
+_SXG_ALG_SPEC = {
+    'ecdsa-p256-sha256': ('ecdsa-p256', 'sha256'),
+    'ecdsa-p384-sha384': ('ecdsa-p384', 'sha384'),
+}
+_HMAC_WEBHOOK_SPEC = {
+    'HMAC-SHA1': 'sha1', 'HMAC-SHA256': 'sha256',
+    'HMAC-SHA512': 'sha512', 'HMAC-MD5': 'md5',
+}
+
+# EC kind -> (curve class | None, JWK crv name, raw coord/half-sig byte length).
+_EC_CURVE = {
+    'ecdsa-p256': (_ch_ec.SECP256R1 if _HAVE_CRYPTO else None, 'P-256', 32),
+    'ecdsa-p384': (_ch_ec.SECP384R1 if _HAVE_CRYPTO else None, 'P-384', 48),
+    'ecdsa-p521': (_ch_ec.SECP521R1 if _HAVE_CRYPTO else None, 'P-521', 66),
+    'ecdsa-secp256k1': (_ch_ec.SECP256K1 if _HAVE_CRYPTO else None,
+                        'secp256k1', 32),
+}
+
+# Menu structure: category -> ordered algorithm labels (every usable technique).
+_SIGN_CATEGORIES = [
+    ('JWT', ['HS256', 'HS384', 'HS512', 'RS256', 'RS384', 'RS512',
+             'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512',
+             'ES256K', 'EdDSA', 'none']),
+    ('RFC 9421', ['hmac-sha256', 'rsa-pss-sha512', 'rsa-v1_5-sha256',
+                  'ecdsa-p256-sha256', 'ecdsa-p384-sha384', 'ed25519']),
+    ('DPoP', ['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512',
+              'ES256', 'ES384', 'ES512', 'ES256K', 'EdDSA']),
+    ('SXG', ['ecdsa-p256-sha256', 'ecdsa-p384-sha384']),
+    ('HMAC Webhooks', ['HMAC-SHA1', 'HMAC-SHA256', 'HMAC-SHA512', 'HMAC-MD5']),
+]
+
+def _sign_spec(category, alg):
+    """(crypto kind, hash name) for a (category, algorithm) leaf."""
+    if category == 'HMAC Webhooks':
+        return ('hmac', _HMAC_WEBHOOK_SPEC[alg])
+    if category == 'RFC 9421':
+        return _RFC9421_ALG_SPEC[alg]
+    if category == 'SXG':
+        return _SXG_ALG_SPEC[alg]
+    return _JWS_ALG_SPEC[alg]          # JWT, DPoP
+
+
+def _b64u(b):
+    """base64url without padding (the JOSE encoding)."""
+    return base64.urlsafe_b64encode(b).rstrip(b'=').decode('ascii')
+
+
+def _int_b64u(n, size):
+    return _b64u(n.to_bytes(size, 'big'))
+
+
+def _hashobj(name):
+    return {'sha1': _ch_hashes.SHA1, 'sha256': _ch_hashes.SHA256,
+            'sha384': _ch_hashes.SHA384, 'sha512': _ch_hashes.SHA512}[name]()
+
+
+def sign_generate_key(kind):
+    """Generate a fresh private-key object appropriate for `kind`."""
+    if kind in ('rsa-pkcs1', 'rsa-pss'):
+        return _ch_rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    if kind == 'ed25519':
+        return _ch_ed.Ed25519PrivateKey.generate()
+    if kind in _EC_CURVE:
+        return _ch_ec.generate_private_key(_EC_CURVE[kind][0]())
+    raise ValueError('no keypair for kind %r' % kind)
+
+
+def sign_private_pem(key):
+    return key.private_bytes(_ch_ser.Encoding.PEM, _ch_ser.PrivateFormat.PKCS8,
+                             _ch_ser.NoEncryption()).decode()
+
+
+def sign_public_pem(key):
+    return key.public_key().public_bytes(
+        _ch_ser.Encoding.PEM,
+        _ch_ser.PublicFormat.SubjectPublicKeyInfo).decode()
+
+
+def sign_load_private(pem):
+    return _ch_ser.load_pem_private_key(pem.encode(), password=None)
+
+
+def sign_public_jwk(key, kind):
+    """Public JWK for the generated key (for DPoP headers / verifier config)."""
+    pub = key.public_key()
+    if kind in ('rsa-pkcs1', 'rsa-pss'):
+        nums = pub.public_numbers()
+        return {'kty': 'RSA',
+                'n': _int_b64u(nums.n, (nums.n.bit_length() + 7) // 8),
+                'e': _int_b64u(nums.e, (nums.e.bit_length() + 7) // 8)}
+    if kind == 'ed25519':
+        raw = pub.public_bytes(_ch_ser.Encoding.Raw, _ch_ser.PublicFormat.Raw)
+        return {'kty': 'OKP', 'crv': 'Ed25519', 'x': _b64u(raw)}
+    if kind in _EC_CURVE:
+        crv, size = _EC_CURVE[kind][1], _EC_CURVE[kind][2]
+        nums = pub.public_numbers()
+        return {'kty': 'EC', 'crv': crv,
+                'x': _int_b64u(nums.x, size), 'y': _int_b64u(nums.y, size)}
+    return {}
+
+
+def sign_raw(kind, hashname, msg, key, ec_raw_size=None):
+    """Sign `msg` (bytes). `key` is a secret (bytes) for 'hmac', else a private-key
+    object. ECDSA returns raw r||s when `ec_raw_size` is given (JWS/RFC 9421), else
+    ASN.1 DER (SXG)."""
+    if kind == 'none':
+        return b''
+    if kind == 'hmac':
+        return _hmaclib.new(key, msg, hashname).digest()
+    if kind == 'ed25519':            # EdDSA has no separate hash parameter
+        return key.sign(msg)
+    h = _hashobj(hashname)
+    if kind == 'rsa-pkcs1':
+        return key.sign(msg, _ch_pad.PKCS1v15(), h)
+    if kind == 'rsa-pss':
+        return key.sign(msg, _ch_pad.PSS(mgf=_ch_pad.MGF1(h),
+                                         salt_length=h.digest_size), h)
+    if kind in _EC_CURVE:
+        der = key.sign(msg, _ch_ec.ECDSA(h))
+        if ec_raw_size:
+            r, s = _ch_decode_dss(der)
+            return (r.to_bytes(ec_raw_size, 'big') +
+                    s.to_bytes(ec_raw_size, 'big'))
+        return der
+    raise ValueError('unknown signing kind %r' % kind)
+
+
+def jwt_encode(alg, header, payload, secret_or_key):
+    """Encode a JWS-compact JWT. `secret_or_key` = secret bytes (HS*), a private
+    key object (asym), or None (none)."""
+    kind, hashname = _JWS_ALG_SPEC[alg]
+    h = dict(header)
+    h['alg'] = alg
+    seg = (_b64u(json.dumps(h, separators=(',', ':')).encode()) + '.' +
+           _b64u(json.dumps(payload, separators=(',', ':')).encode()))
+    if alg == 'none':
+        return seg + '.'
+    ec_size = _EC_CURVE[kind][2] if kind in _EC_CURVE else None
+    sig = sign_raw(kind, hashname, seg.encode(), secret_or_key, ec_raw_size=ec_size)
+    return seg + '.' + _b64u(sig)
+
+
+def rfc9421_signature(alg, sig_base, secret_or_key):
+    """Sign an RFC 9421 signature base; returns the base64 signature value."""
+    kind, hashname = _RFC9421_ALG_SPEC[alg]
+    ec_size = _EC_CURVE[kind][2] if kind in _EC_CURVE else None
+    sig = sign_raw(kind, hashname, sig_base.encode(), secret_or_key,
+                   ec_raw_size=ec_size)
+    return base64.b64encode(sig).decode()
+
+
+# Signed HTTP Exchanges signing context (draft-yasskin-http-origin-signed-responses).
+_SXG_PREFIX = b'\x20' * 64 + b'HTTP Exchange 1 b3' + b'\x00'
+
+
+def sxg_signature(alg, message, key):
+    """ECDSA (DER) signature over the SXG context prefix + `message`, base64."""
+    kind, hashname = _SXG_ALG_SPEC[alg]
+    sig = sign_raw(kind, hashname, _SXG_PREFIX + message, key)
+    return base64.b64encode(sig).decode()
+
+
+def hmac_webhook_raw(alg, message, secret_bytes):
+    return _hmaclib.new(secret_bytes, message, _HMAC_WEBHOOK_SPEC[alg]).digest()
+
+
+class _SignDialog(tk.Toplevel):
+    """Unified token / signature forge (authorised testing). Pick a **Method** and
+    **Algorithm** at the top; every input widget for every method is present, and
+    the ones the current method doesn't use are greyed-out + blocked (same style as
+    the Encode/Decode popup). Non-modal."""
+
+    def __init__(self, parent, selection=''):
+        super().__init__(bg=C['bg'])
+        self.sel = (selection or '').strip()
+        self._key = None        # generated private-key object (asym), cached
+        self._wordlist = None   # loaded list of secrets / PEM keys → batch tokens
+        self._inputs = {}
+        self._groups = {}       # group name -> [widgets to enable/disable]
+        self.category = _SIGN_CATEGORIES[0][0]
+        self.alg = _SIGN_CATEGORIES[0][1][0]
+        self.kind, self.hashname = _sign_spec(self.category, self.alg)
+        self.title('Sign')
+        try:
+            self.lift()
+        except Exception:
+            pass
+        self._build()
+        self._seed_for_category()
+        self._sync()
+        self.update_idletasks()
+        # Default + minimum size big enough to show every widget (minsize keeps a
+        # stale saved geometry from cropping them).
+        req = (max(self.winfo_reqwidth(), 520), self.winfo_reqheight())
+        self.minsize(*req)
+        try:
+            self.geometry('+%d+%d' % (parent.winfo_rootx() + 40,
+                                      parent.winfo_rooty() + 40))
+        except Exception:
+            pass
+        remember_popup_geometry(self, 'SignDialog', default_size=req)
+        self.bind('<Escape>', lambda _e: self.destroy())
+
+    # ── build (all widgets once; _sync greys out the inapplicable ones) ──
+    def _text_block(self, parent, group, label, height):
+        tk.Label(parent, text=label, bg=C['bg'], font=C['font_b'],
+                 anchor='w').pack(fill='x')
+        t = EditText95(parent, height=height, wrap='char')
+        t.pack(fill='x', pady=(0, 4))
+        self._groups.setdefault(group, []).append(t)
+        return t
+
+    def _build(self):
+        top = tk.Frame(self, bg=C['bg'])
+        top.pack(fill='x', padx=8, pady=(8, 4))
+        # Both dropdowns sized to the longest Method-or-Algorithm label (no crop).
+        ddw = max(len(s) for s in
+                  ([c for c, _ in _SIGN_CATEGORIES] +
+                   [a for _, algs in _SIGN_CATEGORIES for a in algs])) + 3
+        tk.Label(top, text='Method:', bg=C['bg'],
+                 font=C['font_b']).pack(side='left')
+        self._cat_var = tk.StringVar(value=self.category)
+        styled_dropdown(top, self._cat_var, [c for c, _ in _SIGN_CATEGORIES],
+                        command=lambda _v: self._on_category(),
+                        width=ddw).pack(side='left', padx=(2, 10))
+        tk.Label(top, text='Algorithm:', bg=C['bg'],
+                 font=C['font_b']).pack(side='left')
+        self._alg_var = tk.StringVar(value=self.alg)
+        self._alg_mb = styled_dropdown(
+            top, self._alg_var, dict(_SIGN_CATEGORIES)[self.category],
+            command=lambda v: self._on_alg(v), width=ddw)
+        self._alg_mb.pack(side='left', padx=2)
+
+        body = tk.Frame(self, bg=C['bg'])
+        body.pack(fill='both', expand=True, padx=8, pady=2)
+        self._inputs['header'] = self._text_block(body, 'header',
+                                                  'Header (JSON):', 3)
+        self._inputs['payload'] = self._text_block(
+            body, 'payload', 'Payload / claims (JSON):', 4)
+        self._inputs['msg'] = self._text_block(body, 'msg',
+                                               'Message / raw body:', 4)
+        self._inputs['components'] = self._text_block(
+            body, 'rfc', 'Covered component lines  ("name": value, one per line):',
+            4)
+        prow = tk.Frame(body, bg=C['bg'])
+        prow.pack(fill='x', pady=2)
+        tk.Label(prow, text='keyid:', bg=C['bg'], font=C['font']).pack(side='left')
+        self._inputs['keyid'] = Entry95(prow, width=12)
+        self._inputs['keyid'].pack(side='left', padx=(2, 8))
+        self._inputs['keyid'].insert(0, 'test-key')
+        tk.Label(prow, text='created:', bg=C['bg'],
+                 font=C['font']).pack(side='left')
+        self._inputs['created'] = Entry95(prow, width=12)
+        self._inputs['created'].pack(side='left', padx=(2, 8))
+        self._inputs['created'].insert(0, str(int(time.time())))
+        tk.Label(prow, text='label:', bg=C['bg'], font=C['font']).pack(side='left')
+        self._inputs['siglabel'] = Entry95(prow, width=8)
+        self._inputs['siglabel'].pack(side='left', padx=2)
+        self._inputs['siglabel'].insert(0, 'sig1')
+        self._groups['rfc'] += [self._inputs['keyid'], self._inputs['created'],
+                                self._inputs['siglabel']]
+
+        orow = tk.Frame(body, bg=C['bg'])
+        orow.pack(fill='x', pady=2)
+        tk.Label(orow, text='Output as:', bg=C['bg'],
+                 font=C['font']).pack(side='left')
+        self._inputs['outenc'] = tk.StringVar(value='hex')
+        self._groups['outenc'] = exclusive_checks(
+            orow, self._inputs['outenc'], [('hex', 'hex'), ('base64', 'base64')],
+            padx=(0, 4))
+
+        srow = tk.Frame(body, bg=C['bg'])
+        srow.pack(fill='x', pady=(4, 0))
+        tk.Label(srow, text='Secret:', bg=C['bg'],
+                 font=C['font_b']).pack(side='left')
+        self._inputs['secret'] = Entry95(srow, width=30)
+        self._inputs['secret'].pack(side='left', padx=4)
+        tk.Label(srow, text='as', bg=C['bg'], font=C['font']).pack(side='left')
+        self._inputs['secretenc'] = tk.StringVar(value='text')
+        som = styled_dropdown(srow, self._inputs['secretenc'],
+                              ['text', 'base64', 'hex'],
+                              width=max(len(s) for s in
+                                        ('text', 'base64', 'hex')) + 3)
+        som.pack(side='left', padx=2)
+        self._groups['secret'] = [self._inputs['secret'], som]
+        # Load Wordlist on the same line, at the extreme right (the green ✓ box
+        # appears just left of it once a list is loaded).
+        wl_btn = Btn(srow, text=' Load Wordlist… ', command=self._load_wordlist)
+        wl_btn.pack(side='right')
+        self._wordlist_box = StatusBox(srow, size=18)
+        self._groups['wordlist'] = [wl_btn]
+
+        tk.Label(body, text='Private key (PEM):', bg=C['bg'], font=C['font_b'],
+                 anchor='w').pack(fill='x')
+        self._inputs['pem'] = EditText95(body, height=5, wrap='char')
+        self._inputs['pem'].pack(fill='x', pady=(0, 2))
+        kb = tk.Frame(body, bg=C['bg'])
+        kb.pack(fill='x', pady=(0, 4))
+        gen_btn = Btn(kb, text=' Generate keypair ', command=self._gen)
+        gen_btn.pack(side='left')
+        self._groups['pem'] = [self._inputs['pem'], gen_btn]
+
+        bar = tk.Frame(self, bg=C['bg'])
+        bar.pack(fill='x', padx=8, pady=(0, 4))
+        Btn(bar, text='  Sign  ', command=self._do_sign,
+            bg='#2e7d32', fg='white').pack(side='left')
+        Btn(bar, text=' Close ', command=self.destroy).pack(side='right')
+        Btn(bar, text=' Copy output ',
+            command=self._copy).pack(side='right', padx=4)
+        tk.Label(self, text='Output:', bg=C['bg'], font=C['font_b'],
+                 anchor='w').pack(fill='x', padx=8)
+        self.out = Text95(self, width=72, height=8, wrap='char')
+        self.out.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+
+    # ── selector callbacks ──────────────────────────────────────────────
+    def _reset_wordlist(self):
+        self._wordlist = None
+        try:
+            self._wordlist_box.clear()
+            self._wordlist_box.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _on_category(self):
+        self.category = self._cat_var.get()
+        self.alg = dict(_SIGN_CATEGORIES)[self.category][0]
+        self._alg_var.set(self.alg)
+        fill_dropdown(self._alg_mb, dict(_SIGN_CATEGORIES)[self.category])
+        self.kind, self.hashname = _sign_spec(self.category, self.alg)
+        self._reset_wordlist()
+        self._sync()
+        self._seed_for_category()
+
+    def _on_alg(self, v):
+        self.alg = v
+        self._alg_var.set(v)
+        self.kind, self.hashname = _sign_spec(self.category, self.alg)
+        self._reset_wordlist()
+        self._sync()
+
+    def _active_groups(self):
+        c, k = self.category, self.kind
+        return {
+            'header': c in ('JWT', 'DPoP'),
+            'payload': c in ('JWT', 'DPoP'),
+            'msg': c in ('HMAC Webhooks', 'SXG'),
+            'rfc': c == 'RFC 9421',
+            'outenc': c == 'HMAC Webhooks',
+            'secret': k == 'hmac',
+            'pem': k not in ('hmac', 'none'),
+            'wordlist': k != 'none',
+        }
+
+    def _sync(self):
+        act = self._active_groups()
+        for name, widgets in self._groups.items():
+            on = act.get(name, True)
+            for w in widgets:
+                try:
+                    w.config(state='normal' if on else 'disabled')
+                except tk.TclError:
+                    pass
+
+    def _set_text(self, key, content):
+        w = self._inputs[key]
+        try:
+            w.config(state='normal')
+            w.delete('1.0', 'end')
+            w.insert('1.0', content or '')
+        except tk.TclError:
+            pass
+
+    def _seed_for_category(self):
+        now = int(time.time())
+        c = self.category
+        if c in ('JWT', 'DPoP'):
+            if c == 'DPoP':
+                header = {'typ': 'dpop+jwt', 'alg': self.alg,
+                          'jwk': '<<click Generate keypair>>'}
+                payload = {'jti': uuid.uuid4().hex, 'htm': 'POST',
+                           'htu': self.sel if self.sel.startswith('http')
+                           else 'https://target.example/token', 'iat': now}
+            else:
+                header = {'alg': self.alg, 'typ': 'JWT'}
+                payload = self._guess_payload(now)
+            self._set_text('header', json.dumps(header, indent=2))
+            self._set_text('payload', json.dumps(payload, indent=2))
+        elif c in ('HMAC Webhooks', 'SXG'):
+            self._set_text('msg', self.sel)
+        elif c == 'RFC 9421':
+            self._set_text('components', self.sel or (
+                '"@method": POST\n"@authority": target.example\n'
+                '"@path": /api/transfer'))
+
+    def _guess_payload(self, now):
+        s = self.sel
+        if s.count('.') >= 2:                 # looks like a JWT — reuse its claims
+            try:
+                mid = s.split('.')[1]
+                mid += '=' * ((4 - len(mid) % 4) % 4)
+                d = json.loads(base64.urlsafe_b64decode(mid))
+                if isinstance(d, dict):
+                    return d
+            except Exception:
+                pass
+        try:
+            d = json.loads(s)
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+        return {'sub': '1', 'name': 'admin', 'role': 'admin', 'iat': now}
+
+    # ── actions ─────────────────────────────────────────────────────────
+    def _gen(self):
+        if not _HAVE_CRYPTO:
+            messagebox.showerror('cryptography required',
+                                 'Install the cryptography package to sign with '
+                                 'asymmetric algorithms.')
+            return
+        try:
+            self._key = sign_generate_key(self.kind)
+        except Exception as e:
+            messagebox.showerror('Key generation failed', str(e))
+            return
+        self._set_text('pem', sign_private_pem(self._key))
+        jwk = sign_public_jwk(self._key, self.kind)
+        if self.category == 'DPoP':
+            try:
+                hdr = json.loads(self._inputs['header'].get('1.0', 'end-1c'))
+            except Exception:
+                hdr = {'typ': 'dpop+jwt', 'alg': self.alg}
+            hdr['jwk'] = jwk
+            self._set_text('header', json.dumps(hdr, indent=2))
+        self.out.set_content(
+            '# Public key — configure the verifier with this:\n' +
+            sign_public_pem(self._key) +
+            '\n# Public JWK:\n' + json.dumps(jwk, indent=2))
+
+    def _encode_secret(self, raw):
+        """Bytes for one secret string per the 'as' selector (text/base64/hex)."""
+        enc = self._inputs['secretenc'].get()
+        if enc == 'base64':
+            return base64.b64decode(raw + '=' * ((4 - len(raw) % 4) % 4))
+        if enc == 'hex':
+            return bytes.fromhex(re.sub(r'\s', '', raw))
+        return raw.encode()
+
+    def _secret_bytes(self):
+        return self._encode_secret(self._inputs['secret'].get())
+
+    def _load_wordlist(self):
+        """Load a list of secrets (one per line, for HMAC) or PEM private keys
+        (split into blocks, for asymmetric) to batch-sign — one token per entry."""
+        path = filedialog.askopenfilename(
+            parent=self, title='Load wordlist (secrets one-per-line, or PEM keys)')
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(errors='replace')
+        except Exception as e:
+            messagebox.showerror('Load failed', str(e))
+            return
+        if self.kind == 'hmac':
+            items = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        else:
+            items = re.findall(
+                r'-----BEGIN [^-]*PRIVATE KEY-----.*?'
+                r'-----END [^-]*PRIVATE KEY-----', text, re.DOTALL)
+        self._wordlist = items or None
+        n = len(items)
+        if n:
+            self._wordlist_box.success()
+            self._wordlist_box.pack(side='right', padx=(0, 6))
+        else:
+            self._wordlist_box.clear()
+            self._wordlist_box.pack_forget()
+            messagebox.showinfo(
+                'Wordlist',
+                'No usable entries found (need one secret per line, or PEM '
+                'private-key blocks).')
+
+    def _asym_key(self):
+        pem = self._inputs['pem'].get('1.0', 'end-1c').strip()
+        if pem:
+            return sign_load_private(pem)
+        if self._key is not None:
+            return self._key
+        raise ValueError('Generate or paste a private key first.')
+
+    def _rfc9421_base(self):
+        lines = [ln for ln in
+                 self._inputs['components'].get('1.0', 'end-1c').splitlines()
+                 if ln.strip()]
+        names = [ln.split(':', 1)[0].strip() for ln in lines]
+        lbl = self._inputs['siglabel'].get().strip() or 'sig1'
+        keyid = self._inputs['keyid'].get().strip()
+        created = self._inputs['created'].get().strip()
+        params = '(' + ' '.join(names) + ')'
+        if created:
+            params += ';created=' + created
+        if keyid:
+            params += ';keyid="%s"' % keyid
+        params += ';alg="%s"' % self.alg
+        base = '\n'.join(lines + ['"@signature-params": ' + params])
+        return base, '%s=%s' % (lbl, params)
+
+    def _do_sign(self):
+        try:
+            self.out.set_content(
+                self._sign_batch() if self._wordlist else self._sign())
+        except Exception as e:
+            messagebox.showerror('Signing failed', str(e))
+
+    def _artifact(self, cred):
+        """The bare signable artifact (the thing you'd fuzz) for one credential."""
+        c = self.category
+        if c in ('JWT', 'DPoP'):
+            header = json.loads(self._inputs['header'].get('1.0', 'end-1c'))
+            payload = json.loads(self._inputs['payload'].get('1.0', 'end-1c'))
+            return jwt_encode(self.alg, header, payload, cred)
+        if c == 'HMAC Webhooks':
+            msg = self._inputs['msg'].get('1.0', 'end-1c').encode()
+            raw = hmac_webhook_raw(self.alg, msg, cred)
+            return (raw.hex() if self._inputs['outenc'].get() == 'hex'
+                    else base64.b64encode(raw).decode())
+        if c == 'RFC 9421':
+            base, _si = self._rfc9421_base()
+            return rfc9421_signature(self.alg, base, cred)
+        if c == 'SXG':
+            msg = self._inputs['msg'].get('1.0', 'end-1c').encode()
+            return sxg_signature(self.alg, msg, cred)
+        return ''
+
+    def _sign_batch(self):
+        """One token/artifact per wordlist entry (copy all → Fuzzer payloads)."""
+        lines = []
+        for item in self._wordlist:
+            try:
+                cred = (self._encode_secret(item) if self.kind == 'hmac'
+                        else sign_load_private(item))
+                lines.append(self._artifact(cred))
+            except Exception as e:
+                lines.append('# [skipped %s…: %s]' % (item[:24].replace('\n', ' '),
+                                                      e))
+        return '\n'.join(lines)
+
+    def _sign(self):
+        c = self.category
+        if c in ('JWT', 'DPoP'):
+            header = json.loads(self._inputs['header'].get('1.0', 'end-1c'))
+            payload = json.loads(self._inputs['payload'].get('1.0', 'end-1c'))
+            if self.kind == 'hmac':
+                key = self._secret_bytes()
+            elif self.kind == 'none':
+                key = None
+            else:
+                key = self._asym_key()
+            return jwt_encode(self.alg, header, payload, key)
+        if c == 'HMAC Webhooks':
+            msg = self._inputs['msg'].get('1.0', 'end-1c').encode()
+            raw = hmac_webhook_raw(self.alg, msg, self._secret_bytes())
+            enc = self._inputs['outenc'].get()
+            val = raw.hex() if enc == 'hex' else base64.b64encode(raw).decode()
+            tag = self.alg.split('-')[1].lower()
+            return ('%s\n\n# common header forms:\n'
+                    'X-Signature: %s\n'
+                    'X-Hub-Signature-256: %s=%s' % (val, val, tag, raw.hex()))
+        if c == 'RFC 9421':
+            base, siginput = self._rfc9421_base()
+            key = (self._secret_bytes() if self.kind == 'hmac'
+                   else self._asym_key())
+            sig = rfc9421_signature(self.alg, base, key)
+            lbl = self._inputs['siglabel'].get().strip() or 'sig1'
+            return ('# signature base\n%s\n\n'
+                    'Signature-Input: %s\n'
+                    'Signature: %s=:%s:' % (base, siginput, lbl, sig))
+        if c == 'SXG':
+            msg = self._inputs['msg'].get('1.0', 'end-1c').encode()
+            sig = sxg_signature(self.alg, msg, self._asym_key())
+            return ('# ECDSA signature over  <SXG context prefix> || message\n'
+                    '# (base64; full SXG CBOR packaging is out of scope)\n%s' % sig)
+        return ''
+
+    def _copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.out.get('1.0', 'end-1c'))
+
+
+
+
+def _menu_selection(widgets):
+    """First non-empty text selection among `widgets` (list or callable)."""
+    ws = widgets() if callable(widgets) else widgets
+    for w in ws:
+        try:
+            s = w.get('sel.first', 'sel.last')
+            if s:
+                return s
+        except tk.TclError:
+            continue
+    return ''
+
+
+def build_sign_submenu(menu, widgets, popup_parent):
+    """Add a single **Sign** command to `menu` — it opens the unified signing popup
+    (`_SignDialog`) seeded with the current text selection of `widgets`. Method +
+    algorithm are picked inside the popup, which shows every widget and greys out
+    the ones the chosen method doesn't use. No separator — Encode/Decode, Sign and
+    Crack stay in one section."""
+    menu.add_command(
+        label='Sign',
+        command=lambda: _SignDialog(popup_parent, _menu_selection(widgets)))
+
+
+# ─────────────────────────────────────────────
+# Password / hash cracking — a "Crack" cascade (same style as Sign) that drives
+# hashcat / John / hashid locally and CrackStation online, over captured hashes.
+# For authorised testing only.
+# ─────────────────────────────────────────────
+# label -> hashcat -m mode number (common types; the dialog field is editable so
+# ANY -m mode works).
+_HASHCAT_MODES = {
+    'MD5': '0', 'SHA-1': '100', 'SHA-256': '1400', 'SHA-512': '1700',
+    'SHA-224': '1300', 'SHA-384': '10800', 'NTLM': '1000', 'LM': '3000',
+    'NetNTLMv2': '5600', 'bcrypt': '3200', 'md5crypt ($1$)': '500',
+    'sha256crypt ($5$)': '7400', 'sha512crypt ($6$)': '1800',
+    'phpass': '400', 'MySQL4.1/5': '300', 'MSSQL(2012/2014)': '1731',
+    'WPA-PBKDF2 (22000)': '22000', 'Kerberos TGS-REP (13100)': '13100',
+    'Kerberos AS-REP (18200)': '18200', 'JWT (HS256)': '16500',
+}
+
+
+def _default_wordlist():
+    """First common wordlist present (rockyou, plain or .gz)."""
+    for p in ('/usr/share/wordlists/rockyou.txt',
+              '/usr/share/wordlists/rockyou.txt.gz',
+              '/usr/share/wordlists/fasttrack.txt'):
+        if os.path.exists(p):
+            return p
+    return ''
+
+
+def _resolve_wordlist(path):
+    """hashcat/john can't read a gzipped list — decompress a `.gz` wordlist to a
+    cached temp file (once) and return that; otherwise return `path` unchanged."""
+    if path.endswith('.gz') and os.path.exists(path):
+        import gzip
+        out = os.path.join(tempfile.gettempdir(), os.path.basename(path)[:-3])
+        if not os.path.exists(out) or os.path.getsize(out) == 0:
+            with gzip.open(path, 'rb') as f, open(out, 'wb') as g:
+                shutil.copyfileobj(f, g)
+        return out
+    return path
+
+
+class _CrackDialog(tk.Toplevel):
+    """Hash-cracking popup (authorised testing). Crack with Hashcat (any hash type
+    via the editable -m, dictionary or brute-force mask, output streamed), plus a
+    one-shot **Identify Hash** for a single hash (runs hashid; the detected type is
+    shown top-right, green when found / red when not). Non-modal."""
+
+    def __init__(self, parent, selection=''):
+        super().__init__(bg=C['bg'])
+        self.sel = (selection or '').strip()
+        self._q = queue.Queue()
+        self._proc = None
+        self._running = False
+        self._tmpfiles = []
+        self.title('Crack')
+        try:
+            self.lift()
+        except Exception:
+            pass
+        self._build()
+        self.update_idletasks()
+        req = (max(self.winfo_reqwidth(), 560), self.winfo_reqheight())
+        self.minsize(*req)
+        try:
+            self.geometry('+%d+%d' % (parent.winfo_rootx() + 40,
+                                      parent.winfo_rooty() + 40))
+        except Exception:
+            pass
+        remember_popup_geometry(self, 'CrackDialog', default_size=req)
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.bind('<Escape>', lambda _e: self._on_close())
+
+    def _build(self):
+        # ── top: one-line hash + Identify Hash button (left), detected type label
+        #    (top-right, green/red) ──
+        top = tk.Frame(self, bg=C['bg'])
+        top.pack(fill='x', padx=8, pady=(8, 4))
+        Btn(top, text=' Identify Hash ',
+            command=self._identify_hash).pack(side='left')
+        self._type_lbl = tk.Label(top, text='', bg=C['bg'], font=C['font_b'])
+        self._type_lbl.pack(side='right', padx=(8, 0))
+        # Fixed width (fits a SHA-256-length hash); does not stretch with the window.
+        self.one_hash = Entry95(top, width=64)
+        self.one_hash.pack(side='left', padx=4)
+        if self.sel and '\n' not in self.sel:
+            self.one_hash.insert(0, self.sel)
+
+        tk.Label(self, text='Hash(es):', bg=C['bg'], font=C['font_b'],
+                 anchor='w').pack(fill='x', padx=8)
+        self.hashes = EditText95(self, width=72, height=5, wrap='char')
+        self.hashes.pack(fill='x', padx=8, pady=(0, 4))
+        if self.sel:
+            self.hashes.set_content(self.sel)
+
+        # ── hashcat options, grid-aligned (labels col 0; controls share col 1 so
+        #    the attack checkboxes, wordlist and mask line up) ──
+        opt = tk.Frame(self, bg=C['bg'])
+        opt.pack(fill='x', padx=8, pady=2)
+        opt.columnconfigure(1, weight=1)
+        tk.Label(opt, text='Hash type:', bg=C['bg'], font=C['font']).grid(
+            row=0, column=0, sticky='e', padx=(0, 6), pady=2)
+        self._type_var = tk.StringVar(value=next(iter(_HASHCAT_MODES)))
+        ddw = max(len(s) for s in _HASHCAT_MODES) + 3
+        styled_dropdown(opt, self._type_var, list(_HASHCAT_MODES),
+                        command=self._set_mode, width=ddw).grid(
+                            row=0, column=1, sticky='w', pady=2)
+        mrow = tk.Frame(opt, bg=C['bg'])
+        mrow.grid(row=0, column=2, sticky='w')
+        tk.Label(mrow, text='-m', bg=C['bg'], font=C['font']).pack(side='left')
+        self.mode = Entry95(mrow, width=8)
+        self.mode.pack(side='left', padx=4)
+        self.mode.insert(0, next(iter(_HASHCAT_MODES.values())))
+
+        tk.Label(opt, text='Attack:', bg=C['bg'], font=C['font']).grid(
+            row=1, column=0, sticky='e', padx=(0, 6), pady=2)
+        arow = tk.Frame(opt, bg=C['bg'])
+        arow.grid(row=1, column=1, columnspan=2, sticky='w')
+        self._attack = tk.StringVar(value='dict')
+        exclusive_checks(arow, self._attack,
+                         [('dict', 'Dictionary'), ('mask', 'Brute-force mask')],
+                         padx=(0, 8))
+
+        tk.Label(opt, text='Wordlist:', bg=C['bg'], font=C['font']).grid(
+            row=2, column=0, sticky='e', padx=(0, 6), pady=2)
+        wrow = tk.Frame(opt, bg=C['bg'])
+        wrow.grid(row=2, column=1, columnspan=2, sticky='we')
+        self.wordlist = Entry95(wrow, width=44)
+        self.wordlist.pack(side='left', fill='x', expand=True)
+        self.wordlist.insert(0, _default_wordlist())
+        Btn(wrow, text='Browse…',
+            command=self._browse_wordlist).pack(side='left', padx=4)
+
+        tk.Label(opt, text='Mask:', bg=C['bg'], font=C['font']).grid(
+            row=3, column=0, sticky='e', padx=(0, 6), pady=2)
+        self.mask = Entry95(opt, width=26)
+        self.mask.grid(row=3, column=1, sticky='w', pady=2)
+        self.mask.insert(0, '?a?a?a?a?a?a')
+
+        bar = tk.Frame(self, bg=C['bg'])
+        bar.pack(fill='x', padx=8, pady=4)
+        self.run_btn = Btn(bar, text='  Crack  ', command=self._start_crack,
+                           bg='#2e7d32', fg='white')
+        self.run_btn.pack(side='left')
+        self.stop_btn = Btn(bar, text=' Stop ', command=self._stop,
+                            state='disabled')
+        self.stop_btn.pack(side='left', padx=4)
+        Btn(bar, text=' Close ', command=self._on_close).pack(side='right')
+        Btn(bar, text=' Copy output ',
+            command=self._copy).pack(side='right', padx=4)
+
+        tk.Label(self, text='Output:', bg=C['bg'], font=C['font_b'],
+                 anchor='w').pack(fill='x', padx=8)
+        self.out = Text95(self, width=84, height=12, wrap='char')
+        self.out.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+
+    def _set_mode(self, type_label):
+        self.mode.delete(0, 'end')
+        self.mode.insert(0, _HASHCAT_MODES.get(type_label, '0'))
+
+    # ── identify (one-shot hashid on the single-line hash) ──
+    def _set_type_label(self, text, ok):
+        self._type_lbl.config(text=text,
+                              fg=('#2e7d32' if ok else '#b71c1c'))
+
+    def _identify_hash(self):
+        h = self.one_hash.get().strip()
+        if not h:
+            self._set_type_label('enter a hash', False)
+            return
+        try:
+            out = subprocess.run(['hashid', '-m', h], capture_output=True,
+                                 text=True, timeout=15).stdout
+        except FileNotFoundError:
+            self._set_type_label('hashid not installed', False)
+            return
+        except Exception as e:
+            self._set_type_label(str(e)[:40], False)
+            return
+        types = [ln[3:].strip() for ln in out.splitlines() if ln.startswith('[+]')]
+        types = [t for t in types if t and t.lower() != 'unknown hash']
+        if types:
+            shown = ', '.join(types[:4]) + ('…' if len(types) > 4 else '')
+            self._set_type_label(shown, True)
+        else:
+            self._set_type_label('No type identified', False)
+
+    def _browse_wordlist(self):
+        p = filedialog.askopenfilename(parent=self, title='Choose a wordlist')
+        if p:
+            self.wordlist.delete(0, 'end')
+            self.wordlist.insert(0, p)
+
+    # ── crack run (hashcat) ──────────────────────────────────────────────
+    def _write_hashes(self, hashes):
+        fd, path = tempfile.mkstemp(prefix='reconner_hashes_', suffix='.txt')
+        with os.fdopen(fd, 'w') as f:
+            f.write('\n'.join(hashes) + '\n')
+        self._tmpfiles.append(path)
+        return path
+
+    def _collect(self):
+        """Gather field values on the UI thread; returns (spec, error)."""
+        hashes = [h.strip() for h in self.hashes.get('1.0', 'end-1c').splitlines()
+                  if h.strip()]
+        if not hashes:
+            return None, 'Enter at least one hash.'
+        spec = {'hashfile': self._write_hashes(hashes),
+                'mode': self.mode.get().strip() or '0',
+                'attack': self._attack.get(),
+                'wordlist': self.wordlist.get().strip(),
+                'mask': self.mask.get().strip() or '?a?a?a?a'}
+        if spec['attack'] == 'dict' and not spec['wordlist']:
+            return None, 'Pick a wordlist for the dictionary attack.'
+        return spec, None
+
+    @staticmethod
+    def _cmds_for(spec):
+        """Build the hashcat command list (worker thread — resolves a .gz wordlist)."""
+        hf, m = spec['hashfile'], spec['mode']
+        if spec['attack'] == 'mask':
+            crack = ['hashcat', '-m', m, '-a', '3', '--force', hf, spec['mask']]
+        else:
+            crack = ['hashcat', '-m', m, '-a', '0', '--force', hf,
+                     _resolve_wordlist(spec['wordlist'])]
+        return [crack, ['hashcat', '-m', m, hf, '--show']]
+
+    def _start_crack(self):
+        if self._running:
+            return
+        spec, err = self._collect()
+        if err:
+            messagebox.showerror('Crack', err)
+            return
+        self.out.set_content('')
+        self._set_running(True)
+        threading.Thread(target=self._worker, args=(spec,), daemon=True).start()
+        self.after(100, self._drain)
+
+    def _worker(self, spec):
+        try:
+            for cmd in self._cmds_for(spec):
+                if not self._running:
+                    break
+                self._q.put(('line', '$ ' + ' '.join(cmd) + '\n'))
+                try:
+                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True,
+                                         bufsize=1)
+                except FileNotFoundError:
+                    self._q.put(('line', '[%s not installed]\n' % cmd[0]))
+                    continue
+                self._proc = p
+                for line in iter(p.stdout.readline, ''):
+                    self._q.put(('line', line))
+                p.wait()
+            self._q.put(('done', 0))
+        except Exception as e:
+            self._q.put(('line', '[error] %s\n' % e))
+            self._q.put(('done', -1))
+
+    def _drain(self):
+        try:
+            while True:
+                kind, val = self._q.get_nowait()
+                if kind == 'line':
+                    self.out.insert('end', val)
+                    self.out.see('end')
+                else:
+                    self._set_running(False)
+        except queue.Empty:
+            pass
+        if self._running:
+            self.after(100, self._drain)
+
+    def _set_running(self, on):
+        self._running = on
+        try:
+            self.run_btn.config(state='disabled' if on else 'normal')
+            self.stop_btn.config(state='normal' if on else 'disabled')
+        except tk.TclError:
+            pass
+        if not on:
+            self._proc = None
+
+    def _stop(self):
+        self._running = False
+        p = self._proc
+        if p is not None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    def _copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.out.get('1.0', 'end-1c'))
+
+    def _on_close(self):
+        self._stop()
+        for p in self._tmpfiles:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        self.destroy()
+
+
+
+
+def build_crack_submenu(menu, widgets, popup_parent):
+    """Add a single **Crack** command to `menu` — it opens the unified cracking
+    popup (`_CrackDialog`) seeded with the current text selection of `widgets`. No
+    separator — it sits in the same section as Encode/Decode and Sign."""
+    menu.add_command(
+        label='Crack',
+        command=lambda: _CrackDialog(popup_parent, _menu_selection(widgets)))
+
+
 
 
 # ─────────────────────────────────────────────
@@ -10543,11 +12370,8 @@ class SetShellDialog(ModalToplevel):
             value=(getattr(node, 'shell_method', 'GET') or 'GET').upper())
         mrow = tk.Frame(wrap, bg=C['bg'])
         mrow.grid(row=3, column=1, sticky='w', pady=3)
-        for m in ('GET', 'POST'):
-            tk.Radiobutton(mrow, text=m, value=m, variable=self.method_var,
-                           bg=C['bg'], activebackground=C['bg'],
-                           selectcolor=C['window'], highlightthickness=0,
-                           font=C['font']).pack(side='left', padx=(0, 8))
+        exclusive_checks(mrow, self.method_var,
+                         [('GET', 'GET'), ('POST', 'POST')], padx=(0, 8))
 
         tk.Label(wrap, text='Request preview:', bg=C['bg'],
                  font=C['font']).grid(row=4, column=0, sticky='e',
@@ -10644,9 +12468,10 @@ class WebShellDialog(tk.Toplevel):
         self.configure(bg='#000000')
         self.minsize(380, 220)
         try:
-            self.transient(parent)
+            self.lift()          # normal (non-transient) window so it edge-tiles
         except tk.TclError:
             pass
+        remember_popup_geometry(self, 'WebShellDialog', default_size=(680, 420))
 
         # Top strip (Win9x grey so the checkbox + target read clearly).
         top = tk.Frame(self, bg=C['bg'])
@@ -11418,6 +13243,8 @@ class _ProxyHandler(socketserver.StreamRequestHandler):
         if not ctrl.intercept_response(flow):
             return False        # dropped → close
 
+        # Manual Open-Browser session: live-inject the element-highlight overlay.
+        ctrl.maybe_inject_highlight(flow)
         self._write_response(wfile, flow)
         ctrl.note_node(flow)
         # Honour an explicit close request from either side.
@@ -11504,6 +13331,10 @@ class InterceptProxy:
         self.port = int(port)
         self.ca = ProxyCA()
         self.intercept = False
+        # When True (set while the Open-Browser manual session is live), HTML
+        # responses get a small overlay script injected that draws a red rectangle
+        # over each element as the user uses it (the whole form when it's in one).
+        self.highlight_browser = False
         self.scope_re = None
         self._server = None
         self._thread = None
@@ -11514,6 +13345,63 @@ class InterceptProxy:
         self.on_node = on_node
         self.on_status = on_status
         self.ui_call = ui_call or (lambda fn: fn())
+
+    # Self-contained overlay injected into HTML pages during a manual Open-Browser
+    # session: draws a red rectangle over each element as it is used (focus / click
+    # / input). When the element belongs to a <form>, every visible non-hidden
+    # control of that form is boxed at once (e.g. username + password + submit) —
+    # the same form-aware logic the old Show-Element screenshot used, but live in
+    # the real DOM. Boxes are cleared on scroll/resize (fixed to the viewport).
+    _HIGHLIGHT_JS = """
+<script>(function(){
+if(window.__reconnerHL)return;window.__reconnerHL=1;
+var BC='#dc1e1e';
+function clr(){var n=document.querySelectorAll('.__reconner_box');for(var i=0;i<n.length;i++){if(n[i].parentNode)n[i].parentNode.removeChild(n[i]);}}
+function box(el){var r=el.getBoundingClientRect();if(r.width<=0||r.height<=0)return;
+var d=document.createElement('div');d.className='__reconner_box';
+d.style.cssText='position:fixed;left:'+r.left+'px;top:'+r.top+'px;width:'+r.width+'px;height:'+r.height+'px;border:3px solid '+BC+';box-sizing:border-box;pointer-events:none;z-index:2147483647;';
+(document.body||document.documentElement).appendChild(d);}
+function hl(el){clr();if(!el||!el.getBoundingClientRect)return;
+var form=el.form||(el.closest?el.closest('form'):null);var list;
+if(form){list=[].slice.call(form.querySelectorAll('input,select,textarea,button,[role=button]')).filter(function(e){if(e.type==='hidden')return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0;});if(!list.length)list=[el];}else{list=[el];}
+for(var i=0;i<list.length;i++)box(list[i]);}
+document.addEventListener('focusin',function(e){hl(e.target);},true);
+document.addEventListener('click',function(e){hl(e.target);},true);
+document.addEventListener('input',function(e){hl(e.target);},true);
+window.addEventListener('scroll',clr,true);
+window.addEventListener('resize',clr,true);
+})();</script>
+"""
+
+    def maybe_inject_highlight(self, flow):
+        """While a manual Open-Browser session is active, append the overlay script
+        to HTML responses (dropping CSP so the inline script runs) so the user sees
+        a red rectangle over each element as they use it. No-op otherwise."""
+        if not self.highlight_browser:
+            return
+        ct = next((v for k, v in flow.resp_headers.items()
+                   if k.lower() == 'content-type'), '') or ''
+        if 'html' not in ct.lower():
+            return
+        body = flow.resp_body
+        if not isinstance(body, bytes):
+            return
+        try:
+            html = body.decode('utf-8', 'replace')
+        except Exception:
+            return
+        low = html.lower()
+        pos = low.rfind('</body>')
+        if pos == -1:
+            pos = low.rfind('</html>')
+        html = (html + self._HIGHLIGHT_JS) if pos == -1 \
+            else (html[:pos] + self._HIGHLIGHT_JS + html[pos:])
+        flow.resp_body = html.encode('utf-8', 'replace')
+        # Drop CSP so the injected inline script is allowed to execute.
+        flow.resp_headers = {
+            k: v for k, v in flow.resp_headers.items()
+            if k.lower() not in ('content-security-policy',
+                                 'content-security-policy-report-only')}
 
     # ── lifecycle ──
     def running(self) -> bool:
@@ -11720,7 +13608,11 @@ class ProxyHistoryDialog(tk.Toplevel):
     # Column id → (heading title, width, numeric?, stretch?). Widths are sized to
     # fit the title plus the sort arrow (' ▲' / ' ▼') the heading grows by when
     # the column is ordered, so the label never clips.
+    # 'Type' column (2nd, after the id): P = proxy traffic, R = Repeater,
+    # F = Fuzzer, S = Scan (browser or fuzzing scan).
+    _SRC_LABEL = {'proxy': 'P', 'repeater': 'R', 'fuzzer': 'F', 'scan': 'S'}
     _COLS = (('id', '#', 54, True, False),
+             ('src', 'Type', 52, False, False),
              ('method', 'Method', 90, False, False),
              ('status', 'Code', 70, True, False),
              ('req_size', 'Req. Size', 100, True, False),
@@ -11734,6 +13626,7 @@ class ProxyHistoryDialog(tk.Toplevel):
         self.title('Proxy History')
         self.configure(bg=C['bg'])
         self.geometry('1080x600')
+        remember_popup_geometry(self, 'ProxyHistoryDialog')
         self._sort_col = None           # column id currently sorted, or None
         self._sort_dir = 0              # 1 ascending, -1 descending, 0 none
         self._visible_ids = []          # ids shown, in display order
@@ -11824,8 +13717,8 @@ class ProxyHistoryDialog(tk.Toplevel):
         self.resp_head_txt = cell(0, 1, 'Response Headers')
         self.resp_body_txt = cell(1, 1, 'Response Body')
 
-        # ── bottom: actions (clear/export on the left; repeater + save node on
-        # the bottom-right, Send to Repeater immediately left of Save as Node) ──
+        # ── bottom: actions (clear/export on the left; on the bottom-right, in
+        # order: Send to Repeater | Send to Fuzzer | Save as Node) ──
         btns = tk.Frame(self, bg=C['bg'])
         btns.pack(fill='x', padx=6, pady=(0, 6))
         Btn(btns, text=' Clear Selected ',
@@ -11836,6 +13729,8 @@ class ProxyHistoryDialog(tk.Toplevel):
             command=self._export_json).pack(side='left', padx=4)
         Btn(btns, text=' Save as Node ',
             command=self._save_selected_node).pack(side='right', padx=(4, 0))
+        Btn(btns, text=' Send to Fuzzer ',
+            command=self._fuzz_selected).pack(side='right', padx=4)
         Btn(btns, text=' Send to Repeater ',
             command=self._repeat_selected).pack(side='right', padx=4)
 
@@ -11866,7 +13761,9 @@ class ProxyHistoryDialog(tk.Toplevel):
         col = self._sort_col
 
         def key(r):
-            v = r.get(col)
+            # The 'src' column's data lives under 'source' (shown as P/R/F).
+            v = (self._SRC_LABEL.get(r.get('source'), '')
+                 if col == 'src' else r.get(col))
             if numeric:
                 try:
                     return (0, float(v))
@@ -11907,7 +13804,9 @@ class ProxyHistoryDialog(tk.Toplevel):
     def _insert(self, rec):
         """Append one history record as a tree row (iid = the record's id)."""
         self.tree.insert('', 'end', iid=str(rec['id']),
-                         values=(rec['id'], rec['method'],
+                         values=(rec['id'],
+                                 self._SRC_LABEL.get(rec.get('source'), ''),
+                                 rec['method'],
                                  rec.get('status') or '',
                                  rec.get('req_size', 0),
                                  rec.get('resp_size', 0),
@@ -11956,6 +13855,13 @@ class ProxyHistoryDialog(tk.Toplevel):
             return
         self.panel.on_repeat_node(self._node_from_record(rec))
 
+    def _fuzz_selected(self):
+        """Open the Fuzzer seeded with the selected transaction."""
+        rec = self._selected_record()
+        if rec is None or not self.panel.on_fuzz_node:
+            return
+        self.panel.on_fuzz_node(self._node_from_record(rec))
+
     # ── right-click context menu (mirrors the Site Structure tree) ──
     def _on_right_click(self, ev):
         """Post a context menu. Over a row: the per-row actions. Over the empty
@@ -11970,6 +13876,7 @@ class ProxyHistoryDialog(tk.Toplevel):
             self.tree.selection_set(iid)
             self._on_select()
             m.add_command(label='Send to Repeater', command=self._repeat_selected)
+            m.add_command(label='Send to Fuzzer', command=self._fuzz_selected)
             m.add_command(label='Save as Node', command=self._save_selected_node)
             m.add_separator()
             m.add_command(label='Clear Selected', command=self._clear_selected)
@@ -11978,8 +13885,7 @@ class ProxyHistoryDialog(tk.Toplevel):
         else:
             m.add_command(label='Clear All History', command=self._clear_all)
             m.add_command(label='Export as JSON', command=self._export_json)
-        m.bind('<Enter>', lambda _e: self._cancel_menu_dismiss(), add='+')
-        m.bind('<Leave>', lambda _e: self._schedule_menu_dismiss(), add='+')
+        arm_menu_autoclose(m, self)   # close once the pointer is outside the menu
         self._ctx_menu = m
         try:
             m.tk_popup(ev.x_root, ev.y_root)
@@ -12148,23 +14054,29 @@ class ProxyPanel(tk.Frame):
     Forward / Forward-and-continue / Drop drive the InterceptProxy controller, and
     the editor text is parsed back into the flow before it is released — so both
     the request sent and the response delivered can be edited. The Intercept
-    button toggles trapping; Open Browser launches the system browser through the
-    proxy."""
+    button toggles trapping; the Open Browser button launches a real proxied
+    browser for manual exploration (traffic flows through the proxy and the
+    page live-highlights each element as you use it)."""
 
     def __init__(self, parent, controller=None, on_open_browser=None,
-                 on_save_node=None, on_repeat_node=None, **kw):
+                 on_save_node=None, on_repeat_node=None, on_fuzz_node=None,
+                 is_scan_active=None, on_intercept_change=None, **kw):
         """Build the panel; `controller` is the InterceptProxy (may be set later
-        via set_controller), `on_open_browser` opens the system browser,
-        `on_save_node(node)` adds a SiteNode to the graph, and
-        `on_repeat_node(node)` opens the Repeater seeded with one."""
+        via set_controller), `is_scan_active()` reports whether a scan is running
+        (intercept can't be turned on during a scan), `on_open_browser()` launches
+        the proxied manual browser, `on_save_node(node)` adds a SiteNode to the
+        graph, and
+        `on_repeat_node(node)` / `on_fuzz_node(node)` open the Repeater / Fuzzer
+        seeded with one."""
         super().__init__(parent, bg=C['bg'], relief='ridge', bd=2, **kw)
         self.controller = controller
         self.on_open_browser = on_open_browser
         self.on_save_node = on_save_node
         self.on_repeat_node = on_repeat_node
+        self.on_fuzz_node = on_fuzz_node
+        self.is_scan_active = is_scan_active
+        self.on_intercept_change = on_intercept_change  # app hook: kills scan + re-locks
         self._current = None            # the ProxyFlow being shown, or None
-        self._enc_vars = make_encode_vars()      # URL / Base64 / Hex (one at a time)
-        self._enc_mode = encode_mode_getter(self._enc_vars)
         self.history = []               # every relayed transaction (records)
         self._history_win = None        # the open ProxyHistoryDialog, if any
         self._build()
@@ -12195,15 +14107,23 @@ class ProxyPanel(tk.Frame):
         self.drop_btn = Btn(bar, text=' ✕ ', command=self._drop,
                             bg='#b71c1c', fg='white', state='disabled')
         self.drop_btn.pack(side='left', padx=2)
-        self.open_btn = Btn(bar, text=' Open Browser ', command=self._open_browser)
-        self.open_btn.pack(side='left', padx=(10, 2))
         self.history_btn = Btn(bar, text=' History ', command=self._open_history)
         self.history_btn.pack(side='left', padx=2)
-        # Top-right: save the displayed transaction as a graph node. Only usable
-        # once the request has been sent and its response caught (response phase).
-        self.save_node_btn = Btn(bar, text=' Save as Node ',
-                                 command=self._save_as_node, state='disabled')
-        self.save_node_btn.pack(side='right', padx=2)
+        # Open Browser: launch a real browser routed through the proxy (ZAP-style
+        # manual explore) so you can navigate and intercept traffic. The proxy
+        # live-injects an overlay that draws a red rectangle over each element as
+        # you use it (the whole form when the element belongs to one).
+        self.browser_btn = Btn(bar, text=' Open Browser ',
+                               command=self._open_browser)
+        self.browser_btn.pack(side='left', padx=(10, 2))
+        # Top-right: Encode / Decode dropdowns (Base64 / Hex / URL / Octal) that
+        # transform the highlighted selection of any of the four boxes and show the
+        # result in a popup. (Replaces the old Save-as-Node button — saving a
+        # transaction is still available from the proxy History popup.)
+        self._codec_btn = build_codec_menus(
+            bar, lambda: [self.req_txt, self.body_txt,
+                          self.resp_txt, self.resp_body_txt], side='right',
+            show_images_cb=self._show_images)
 
         cont, self.req_txt, self.body_txt, self.resp_txt, self.resp_body_txt = \
             _build_req_resp_fixed(self, req_label='Request Header',
@@ -12211,15 +14131,23 @@ class ProxyPanel(tk.Frame):
                                   resp_label='Response Header',
                                   resp_body_label='Response Body',
                                   req_editable=True, resp_editable=True)
-        # Bottom bar (encode-typing checkboxes pinned to the bottom-right), packed
-        # before the editor so it stays anchored to the bottom edge.
-        botbar = tk.Frame(self, bg=C['bg'])
-        botbar.pack(side='bottom', fill='x', padx=6, pady=(0, 4))
-        build_encode_checks(botbar, self._enc_vars, suffix='typing', side='right')
         cont.pack(fill='both', expand=True, padx=6, pady=(2, 4))
-        _bind_encode(self.req_txt, self._enc_mode)
-        _bind_encode(self.body_txt, self._enc_mode)
         self._show_empty()
+        # Right-click anywhere in the panel opens the same Options menu.
+        bind_rightclick_menu(self, self._codec_btn.codec_menu)
+
+    def _show_images(self):
+        """Render any images in the currently-shown response (Options ▸ Show
+        Images). Uses the live flow's raw bytes plus any data: URIs in the body."""
+        f = self._current
+        if f is None:
+            messagebox.showinfo('Show Images', 'Select a transaction first.')
+            return
+        ctype = next((v for k, v in (f.resp_headers or {}).items()
+                      if k.lower() == 'content-type'), '')
+        body = f.resp_body if isinstance(f.resp_body, bytes) else b''
+        show_images_popup(self, ctype, body,
+                          self.resp_body_txt.get('1.0', 'end-1c'))
 
     # ── status / intercept toggle ──
     def set_status(self, msg):
@@ -12228,12 +14156,24 @@ class ProxyPanel(tk.Frame):
         return
 
     def _toggle_intercept(self):
-        """Flip interception on/off via the controller and re-sync the toolbar."""
+        """Flip interception on/off via the controller and re-sync the toolbar.
+        The button is greyed-out while a scan runs (the scanner and interceptor
+        can't run together); the app's on_intercept_change handler also kills any
+        running scan as a safeguard when intercept goes ON."""
         if not self.controller:
             return
         self.controller.set_intercept(not self.controller.intercept)
         self._refresh_intercept_btn()
         self._update_buttons()
+        if self.on_intercept_change is not None:
+            self.on_intercept_change(self.controller.intercept)
+
+    def set_intercept_locked(self, locked):
+        """Grey out / re-enable the Intercept toggle (locked while a scan runs)."""
+        try:
+            self.intercept_btn.config(state=('disabled' if locked else 'normal'))
+        except tk.TclError:
+            pass
 
     def _refresh_intercept_btn(self):
         """Repaint the Intercept button: green ON, red OFF (fixed width)."""
@@ -12272,16 +14212,11 @@ class ProxyPanel(tk.Frame):
         """Enable/disable the toolbar buttons by intercept state. With intercept
         OFF everything here is greyed/blocked (the drop button stays red, only its
         state changes). With intercept ON, the forward/drop buttons also need a
-        trapped flow; Open Browser just needs intercept on."""
+        trapped flow."""
         on = bool(self.controller and self.controller.intercept)
         have = self._current is not None
-        caught = have and self._current.status is not None
         self.fwd_btn.config(state=('normal' if on and have else 'disabled'))
         self.drop_btn.config(state=('normal' if on and have else 'disabled'))
-        self.open_btn.config(state=('normal' if on else 'disabled'))
-        # Save as Node needs a sent request with a caught response — independent
-        # of the intercept toggle.
-        self.save_node_btn.config(state=('normal' if caught else 'disabled'))
 
     # ── actions ──
     def _edited_head_body(self):
@@ -12305,11 +14240,6 @@ class ProxyPanel(tk.Frame):
         if not (self.controller and self._current):
             return
         self.controller.resolve('drop')
-
-    def _open_browser(self):
-        """Launch the system browser through the proxy (delegates to the app)."""
-        if self.on_open_browser:
-            self.on_open_browser()
 
     # ── save as node (shared with the History popup) ──
     @staticmethod
@@ -12397,6 +14327,7 @@ class ProxyPanel(tk.Frame):
             else len((flow.resp_body or '').encode('utf-8', 'replace'))
         rec = {
             'id': flow.id,
+            'source': 'proxy',
             'method': flow.method,
             'url': flow.url,
             'status': flow.status,
@@ -12414,6 +14345,81 @@ class ProxyPanel(tk.Frame):
         if self._history_win is not None:
             self._history_win.add_row(rec)
 
+    def record_external(self, raw, base_url, response, response_text,
+                        source='repeater'):
+        """Record a Repeater/Fuzzer-generated transaction in the history, tagged
+        with `source` ('repeater'/'fuzzer') so the History popup's Type column
+        shows R / F. `raw` is the sent request text, `response` the
+        requests.Response (or None), `response_text` the formatted raw response.
+        Runs on the UI thread."""
+        parsed = parse_raw_request(raw, base_url)
+        if not parsed:
+            return
+        method, url, req_headers, req_body = parsed
+        req_head, _ = split_req_body(raw)
+        resp_head, resp_body = split_req_body(response_text or '')
+        if response is not None:
+            status = response.status_code
+            reason = getattr(response, 'reason', '') or ''
+            resp_headers = dict(response.headers)
+        else:
+            status, reason, resp_headers = None, '', {}
+        rb = req_body or ''
+        rec = {
+            'id': next(ProxyFlow._ids),     # shared id counter — never collides
+            'source': source,
+            'method': method, 'url': url, 'status': status, 'reason': reason,
+            'req_size': len(rb.encode('utf-8', 'replace')),
+            'resp_size': len((resp_body or '').encode('utf-8', 'replace')),
+            'req_headers': dict(req_headers or {}),
+            'resp_headers': resp_headers,
+            'req_head': req_head, 'req_body': rb,
+            'resp_head': resp_head, 'resp_body': resp_body,
+        }
+        self.history.append(rec)
+        if self._history_win is not None:
+            self._history_win.add_row(rec)
+
+    def record_node(self, node, source='scan'):
+        """Record a scanner-captured request/response (a SiteNode) in the history,
+        tagged `source` ('scan') so the Type column shows 'S'. Builds the row from
+        the node's captured request/response fields. Runs on the UI thread."""
+        url = node.req_url or node.url
+        if not url:
+            return
+        method = node.req_method or 'GET'
+        req_headers = dict(node.req_headers or {})
+        resp_headers = dict(node.resp_headers or {})
+        req_body = node.req_body if isinstance(node.req_body, str) \
+            else (node.req_body or b'').decode('utf-8', 'replace')
+        resp_body = node.resp_body if isinstance(node.resp_body, str) \
+            else (node.resp_body or b'').decode('utf-8', 'replace')
+        status = node.resp_status
+        reason = node.resp_reason or ''
+        pu = urlparse(url)
+        path = (pu.path or '/') + (('?' + pu.query) if pu.query else '')
+        rlines = [f'{method} {path} HTTP/1.1', f'Host: {pu.netloc}']
+        rlines += [f'{k}: {v}' for k, v in req_headers.items()
+                   if k.lower() != 'host']
+        req_head = '\n'.join(rlines)
+        slines = [(f'HTTP/1.1 {status if status is not None else ""} '
+                   f'{reason}').rstrip()]
+        slines += [f'{k}: {v}' for k, v in resp_headers.items()]
+        resp_head = '\n'.join(slines)
+        rec = {
+            'id': next(ProxyFlow._ids),
+            'source': source,
+            'method': method, 'url': url, 'status': status, 'reason': reason,
+            'req_size': len(req_body.encode('utf-8', 'replace')),
+            'resp_size': len(resp_body.encode('utf-8', 'replace')),
+            'req_headers': req_headers, 'resp_headers': resp_headers,
+            'req_head': req_head, 'req_body': req_body,
+            'resp_head': resp_head, 'resp_body': resp_body,
+        }
+        self.history.append(rec)
+        if self._history_win is not None:
+            self._history_win.add_row(rec)
+
     def _open_history(self):
         """Open (or focus) the proxy History popup."""
         if self._history_win is not None and self._history_win.winfo_exists():
@@ -12421,6 +14427,11 @@ class ProxyPanel(tk.Frame):
             self._history_win.focus_force()
             return
         self._history_win = ProxyHistoryDialog(self.winfo_toplevel(), self)
+
+    def _open_browser(self):
+        """Launch the proxied manual-explore browser via the app callback."""
+        if self.on_open_browser is not None:
+            self.on_open_browser()
 
 
 # ─────────────────────────────────────────────
@@ -12565,8 +14576,9 @@ class WizardAnimator:
                     'StartListening']
     # Self-looping animations (loop via `branching`, exit via `exitBranch`).
     LISTEN_LOOPS = ['Reading']
-    THINK_LOOPS = ['Reading', 'Processing', 'Thinking', 'Searching']
-    SEND_LOOPS = ['Writing', 'Processing']
+    THINK_LOOPS = ['Searching']         # ONLY the seeing/scry-orb loop (SCRY)
+    SEND_LOOPS = ['Writing']            # the writing loop while output streams
+    SUGGEST = 'Suggest'                 # the lightbulb "idea!" gesture (one-shot)
     # Reaction animations. The magic spell = DoMagic1 (raise wand to its peak) →
     # DoMagic2 (cast + settle the wand down ONCE) → RestPose.
     DOMAGIC1_PEAK = 11                  # last DoMagic1 frame (wand at its peak);
@@ -12575,9 +14587,14 @@ class WizardAnimator:
     #                                     f11+ bob the wand up/down again — skip them.
     SCRY = 'Searching'                  # gaze into the scry orb (looped)
     SCRY_MS = (5000, 8000)             # how long to gaze before returning to idle
+    APPLAUSE = 'Congratulate'           # all tests in a node done (one-shot)
+    TROPHY = 'Congratulate_2'           # every test overall done (one-shot)
+    PROCESS = 'Processing'              # processing loop (also a fuzzer "working" anim)
+    FUZZ_MAX_MS = 900000                # safety cap: auto-finish a held fuzzer anim
+    #                                     after 15 min if the 'done' signal is missed
     REST = 'RestPose'
     IDLE_REST_MS = 5000                 # fixed 5 s pause between idle moves
-    INACTIVITY_MS = 30000               # → sleep after this long with no interaction
+    INACTIVITY_MS = 600000              # → sleep after 10 min with no interaction
     _EXIT_GUARD = 80                    # max steps while exiting (loop-path safety)
 
     def __init__(self, stage_label, agent, tk_widget):
@@ -12587,12 +14604,16 @@ class WizardAnimator:
         self.agent = agent
         self.tk = tk_widget
         self._mode = 'off'              # off/open/idle/listening/thinking/sending/
-        #                                 trick/close
+        #                                 trick/fuzzing/sleeping/waking/close
         self._frame_after = None
         self._gap_after = None
         self._idle_exit_after = None
         self._wind_after = None
         self._inactive_after = None
+        self._fuzz_after = None         # safety cap for a held fuzzer animation
+        self._fuzz_kind = None          # which fuzzer anim is currently held
+        self._minsend_after = None      # min-visible writing timer (fast replies)
+        self._pending_stop = False      # output finished mid thinking→sending
         self._cur_photo = None
         # active frame-graph run
         self._cur_anim = None
@@ -12728,7 +14749,8 @@ class WizardAnimator:
     def _cancel_gap(self):
         """Cancel both the idle-rest timer and the idle-loop wind-down nudge (any
         mode transition calls this, so a stray nudge can't exit a later cycle)."""
-        for attr in ('_gap_after', '_idle_exit_after', '_wind_after'):
+        for attr in ('_gap_after', '_idle_exit_after', '_wind_after',
+                     '_fuzz_after', '_minsend_after'):
             t = getattr(self, attr, None)
             if t is not None:
                 try:
@@ -12933,6 +14955,7 @@ class WizardAnimator:
     def go_thinking(self):
         """User sent input: switch to the thinking cycle, winding down a listening
         loop first if one is running."""
+        self._pending_stop = False      # fresh request
         if self._mode in ('listening',):
             self.end_loop(self.start_thinking)
         else:
@@ -12940,7 +14963,7 @@ class WizardAnimator:
 
     # ── thinking (model is silent) ──
     def start_thinking(self):
-        """Thinking cycle: confused, then a seamless think/read/search loop."""
+        """Thinking cycle: confused, then a seamless seeing/scry-orb loop (SCRY)."""
         self._mode = 'thinking'
         self._cancel_gap()
         self._loop_then = self.start_idle
@@ -12960,37 +14983,105 @@ class WizardAnimator:
             after_intro()
 
     def thinking_to_sending(self):
-        """Output started: wind the thinking loop down and begin the sending loop
-        so the writing animation shows while output streams."""
-        self.end_loop(self.start_sending)
+        """Output started: wind the thinking loop down, flash the lightbulb (a
+        one-shot 'idea!' Suggest), then begin the writing loop while output
+        streams."""
+        self.end_loop(self._lightbulb_to_sending)
+
+    def _lightbulb_to_sending(self):
+        """Play the lightbulb (Suggest) once, then drop into the writing loop."""
+        self._mode = 'sending'
+        self._cancel_gap()
+        if self.agent.frames(self.SUGGEST):
+            self._run_linear(self.SUGGEST, self.start_sending)
+        else:
+            self.start_sending()
 
     # ── sending (output is streaming) ──
     def start_sending(self):
-        """Sending cycle: a seamless writing/processing loop."""
+        """Sending cycle: ONLY the seamless writing loop (the one-shot lightbulb
+        plays just before this, in _lightbulb_to_sending)."""
         self._mode = 'sending'
         self._cancel_gap()
         self._loop_then = self.start_idle
         self._loop_stop = False
         self._start_loop(self._pick(self.SEND_LOOPS))
+        # If the output already finished while we were still transitioning out of
+        # thinking (a fast / non-streamed reply), show the writing loop for a brief
+        # minimum so the sending animation is always seen, then wind down to idle.
+        if self._pending_stop:
+            self._pending_stop = False
+            self._minsend_after = self.tk.after(700, self.stop_sending)
 
     def stop_sending(self):
-        """Output finished: wind the writing loop down → idle."""
+        """Output finished: wind the writing loop down → idle. If the writing
+        animation hasn't started yet (output raced the thinking→sending
+        transition), defer — start_sending will play it briefly then call back."""
+        if self._mode == 'thinking':
+            self._pending_stop = True
+            return
         self.end_loop(self.start_idle)
 
     # ── trick (clicking a Reconner widget) ──
     def react(self, kind='magic'):
-        """React to a Reconner action. Wakes if asleep; otherwise (only while idle)
-        casts the magic spell — except 'fuzzer', which gazes into the scry orb or
-        casts, chosen at random."""
+        """React to a Reconner action. 'fuzzer'/'scry' begin a sustained 'working'
+        loop held until 'fuzzer_done'/'scry_done'; 'applause'/'trophy'/'lightbulb'
+        are one-shot celebrations; everything else (only while idle) casts the
+        magic spell. Wakes the wizard first if it's asleep."""
+        if kind == 'fuzzer_done':
+            self.stop_fuzzing()         # mode is 'fuzzing' here, not 'idle'
+            return
+        if kind == 'scry':              # AI scheduling started — gaze into the orb
+            self.start_scrying()
+            return
+        if kind == 'scry_done':         # scheduling finished — lightbulb idea
+            self.finish_scrying()
+            return
         if self._mode == 'sleeping':
             self.wake()
             return
         if self._mode != 'idle':
             return
-        if kind == 'fuzzer' and self.agent.frames(self.SCRY) and random.random() < 0.5:
-            self.do_scry()
+        if kind == 'fuzzer':
+            self.start_fuzzing()
+        elif kind == 'applause':
+            self._play_oneshot(self.APPLAUSE)
+        elif kind == 'trophy':
+            self._play_oneshot(self.TROPHY)
+        elif kind == 'lightbulb':
+            self._play_oneshot(self.SUGGEST)
         else:
             self.do_magic()
+
+    def _play_oneshot(self, anim):
+        """Play a single non-looping animation, then return to idle. From idle."""
+        if not self.agent.frames(anim):
+            self.start_idle()
+            return
+        self._mode = 'trick'
+        self._cancel_gap()
+        self._run_linear(anim, self.start_idle)
+
+    # ── scrying (sustained while the AI schedules tests) ──
+    def start_scrying(self):
+        """AI test-scheduling started: a sustained scry-orb (Searching) loop held
+        until finish_scrying(). Only engages from idle."""
+        if self._mode != 'idle':
+            return
+        self._mode = 'scrying'
+        self._cancel_gap()
+        self._cancel_inactivity()
+        self._loop_then = self.start_idle
+        self._loop_stop = False
+        self._start_loop(self.SCRY)
+
+    def finish_scrying(self):
+        """Scheduling finished: wind the scry loop down, then the lightbulb 'idea!'
+        (Suggest) once → idle."""
+        if self._mode == 'scrying':
+            self.end_loop(lambda: self._play_oneshot(self.SUGGEST))
+        elif self._mode == 'idle':
+            self._play_oneshot(self.SUGGEST)
 
     def do_magic(self):
         """Cast: DoMagic1 (up to the wand peak — skip its lowering return) flows
@@ -13008,20 +15099,38 @@ class WizardAnimator:
                                      last=self.DOMAGIC2_END),
             last=self.DOMAGIC1_PEAK)
 
-    def do_scry(self):
-        """Gaze into the scry orb (Searching) on a seamless loop for a few seconds,
-        then return to idle."""
-        self._mode = 'trick'
+    # ── fuzzer (sustained while a fuzz run is in flight) ──
+    def start_fuzzing(self):
+        """Fuzzer started: enter a sustained 'working' state — ONLY the processing
+        loop — and keep it going until stop_fuzzing() (the fuzz run completes).
+        Only engages from idle."""
+        if self._mode != 'idle':
+            return
+        self._mode = 'fuzzing'
         self._cancel_gap()
+        self._cancel_inactivity()       # no sleeping while a fuzz run is in flight
+        self._fuzz_kind = 'processing'
+        # Safety: auto-finish if the 'done' signal never arrives.
+        self._fuzz_after = self.tk.after(self.FUZZ_MAX_MS, self.stop_fuzzing)
         self._loop_then = self.start_idle
         self._loop_stop = False
-        self._start_loop(self.SCRY)
-        self._gap_after = self.tk.after(
-            random.randint(*self.SCRY_MS), lambda: self.end_loop(self.start_idle))
+        self._start_loop(self.PROCESS)
+
+    def stop_fuzzing(self):
+        """Fuzz run finished: wind the processing loop down → idle."""
+        if self._mode != 'fuzzing':
+            return
+        if self._fuzz_after is not None:
+            try:
+                self.tk.after_cancel(self._fuzz_after)
+            except Exception:
+                pass
+            self._fuzz_after = None
+        self.end_loop(self.start_idle)
 
 
 class WizardMemory:
-    """Two-tier persistent store for the Wizard, in ~/.wizard-ai/:
+    """Two-tier persistent store for the Wizard, in ~/.reconner/:
 
       • conversation.json — the running CHAT HISTORY (a log of raw exchanges). It
         is NOT replayed into the chat (each open starts fresh) and is NOT fed back
@@ -13035,7 +15144,7 @@ class WizardMemory:
     All file operations fail silently — a memory hiccup must never break the chat.
     """
 
-    DIR = os.path.expanduser('~/.wizard-ai')
+    DIR = os.path.expanduser('~/.reconner')
     LOG_FILE = 'conversation.json'
     NOTES_FILE = 'memory.md'
     LOG_MAX = 400                # messages kept in the raw log
@@ -13140,25 +15249,38 @@ class WizardAssistantDialog(tk.Toplevel):
     farewell on close (deferring the close until the animation finishes).
 
     Each chat starts FRESH (no replayed output). Continuity comes from
-    WizardMemory (~/.wizard-ai/): the distilled `memory.md` is injected as silent
+    WizardMemory (~/.reconner/): the distilled `memory.md` is injected as silent
     context so the Wizard recalls earlier findings, while the raw chat log is kept
     separately. Right-click the wizard to clear the current chat."""
 
     def __init__(self, parent, agent, ai, model='wizard-ai',
-                 geometry='', on_geometry=None):
+                 geometry='', on_geometry=None,
+                 node_source=None, history_source=None, tech_source=None,
+                 schedule=None):
         """Build over a loaded MerlinAgent + the app's `ollama` client. `geometry`
         ('WxH+X+Y') restores the last position/size; `on_geometry(geom)` is called
-        with the current geometry when the popup closes so it can be remembered."""
+        with the current geometry when the popup closes so it can be remembered.
+        `node_source`/`history_source`/`tech_source` are callables returning a list
+        of (label, analyzable_text) tuples for the Analyze buttons (graph nodes,
+        proxy history, tech fingerprints) — each may target one item or ALL.
+        `schedule` is the app-owned per-node test-schedule dict (node label -> list
+        of {'text','done'}) the Test Scheduler reads/writes (persists across
+        re-opens)."""
         super().__init__(parent, bg=C['bg'])
         self.agent = agent
         self.ai = ai
         self.model = model
         self.on_geometry = on_geometry
-        # Shared CWES knowledge base (same one reconner-ai is grounded in): it
-        # drives the reference browser on the right and the category the seeker
-        # is reading is folded into the chat context.
+        self.node_source = node_source
+        self.history_source = history_source
+        self.tech_source = tech_source
+        # CWES knowledge base that grounds wizard-ai (its compact index is folded
+        # into the chat context). Display-only browsing was replaced by the Test
+        # Scheduler; the AI grounding stays.
         self.kb = getattr(ai, 'kb', None)
-        self._kb_phase = self._kb_module = self._kb_cat = ''
+        # Per-node test schedule (app-owned so it survives re-opening the popup).
+        self.schedule = schedule if schedule is not None else {}
+        self._sched_node = None         # the node label currently shown
         self.title('Wizard')
         self.configure(bg=C['bg'])
         self.history = []                       # fresh session (nothing replayed)
@@ -13211,10 +15333,15 @@ class WizardAssistantDialog(tk.Toplevel):
         self.stage.pack(pady=(8, 0))
         self.stage.bind('<Button-1>', lambda _e: self._on_trick())
 
-        # Far-right column: the CWES knowledge-base reference browser (three
-        # stacked dropdowns + a read-only content pane). Built first so the
-        # chat balloon gets whatever width is left.
-        self._build_kb_panel(body)
+        # Three stacked Analyze actions under the wizard, each with a target
+        # dropdown to its right (pick one item or ALL). Results stream into the
+        # chat below as the wizard's reply (wizard-ai).
+        self._build_analyze_panel(left)
+
+        # Far-right column: the Test Scheduler (node dropdown + per-node task
+        # list + complete/uncomplete + the scrying-orb AI button). Built first so
+        # the chat balloon gets whatever width is left.
+        self._build_scheduler_panel(body)
 
         right = tk.Frame(body, bg=C['bg'])
         right.pack(side='left', fill='both', expand=True, padx=(8, 0))
@@ -13236,6 +15363,10 @@ class WizardAssistantDialog(tk.Toplevel):
                                    font=C['font_b'])
         self.transcript.tag_config('wiz', foreground='#2e7d32',
                                    font=C['font_b'])
+        # Lightweight markdown rendering: `code`/```fences``` as a monospace box,
+        # **bold** as bold (shared by the chat transcript and the KB pane).
+        self.transcript.tag_config('code', font=C['mono'], background='#f3f3e0')
+        self.transcript.tag_config('bold', font=C['font_b'])
         self._balloon_win = self.balloon.create_window(0, 0, anchor='nw',
                                                        window=inner)
         self.balloon.bind('<Configure>', self._draw_balloon)
@@ -13247,114 +15378,597 @@ class WizardAssistantDialog(tk.Toplevel):
         if self.agent.available():
             self.entry.focus_set()
 
+    # ── analyze actions (node / history / tech → wizard-ai) ──
+    def _build_analyze_panel(self, left):
+        """Three stacked [Analyze … | target ▾] rows under the wizard. The dropdown
+        lets the user target a single item or ALL; clicking the button streams the
+        wizard-ai analysis into the chat transcript."""
+        # A two-line gap below the wizard before the actions (each line ≈ the
+        # space a dropdown row occupies); sized precisely once the rows are laid
+        # out, so the buttons sit lower under the sprite.
+        self._an_spacer = tk.Frame(left, bg=C['bg'], height=50)
+        self._an_spacer.pack(side='top', fill='x')
+        acts = tk.Frame(left, bg=C['bg'])
+        acts.pack(side='top', fill='x', pady=(0, 4))
+        self._an_acts = acts
+        self._an_sel = {}        # kind -> StringVar (selected label, or 'ALL')
+        specs = [
+            ('node',    'Analyze Node',    lambda: self.node_source),
+            ('history', 'Analyze History', lambda: self.history_source),
+            ('tech',    'Analyze Tech',    lambda: self.tech_source),
+        ]
+        # Uniform widths so every button and every dropdown is the same size and
+        # the two columns line up (grid keeps them aligned across rows).
+        BTN_W = DD_W = 15
+        for i, (kind, label, src_getter) in enumerate(specs):
+            var = tk.StringVar(value='ALL')
+            self._an_sel[kind] = var
+            Btn(acts, text=label, width=BTN_W, anchor='w',
+                command=lambda k=kind: self._analyze(k)).grid(
+                    row=i, column=0, sticky='ew', pady=2)
+            # The dropdown is a Btn that opens the SAME scrollable menu-style popup
+            # as the others; its text tracks the selection + the ▾ triangle.
+            mb = Btn(acts, text='ALL  ▾', width=DD_W, anchor='w')
+            mb.config(command=lambda k=kind, g=src_getter, b=mb:
+                      self._open_an_popup(k, g, b))
+            var.trace_add('write',
+                          lambda *_a, m=mb, v=var: self._an_set_label(m, v))
+            mb.grid(row=i, column=1, sticky='ew', padx=(6, 0), pady=2)
+        acts.columnconfigure(0, weight=0)
+        acts.columnconfigure(1, weight=0)
+        self.after(250, self._size_an_spacer)
+
+    def _size_an_spacer(self):
+        """Resize the gap above the actions to exactly two dropdown-row heights
+        once the rows have a real size."""
+        acts = getattr(self, '_an_acts', None)
+        sp = getattr(self, '_an_spacer', None)
+        if acts is None or sp is None:
+            return
+        try:
+            if not acts.winfo_exists():
+                return
+            acts.update_idletasks()
+            h = acts.winfo_height()
+            if h > 3:
+                sp.config(height=max(40, int(2 * h / 3)))   # 3 rows → 2-row gap
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _an_set_label(mb, var):
+        """Show the current selection on an Analyze dropdown with the ▾ triangle
+        (truncated to keep the fixed width)."""
+        val = var.get() or 'ALL'
+        disp = val if len(val) <= 12 else val[:11] + '…'
+        try:
+            mb.config(text=disp + '  ▾')
+        except tk.TclError:
+            pass
+
+    def _open_an_popup(self, kind, src_getter, anchor):
+        """Open the scrollable target picker for an Analyze dropdown: ALL plus one
+        row per currently-available item (rebuilt each open — nodes/history/tech
+        grow during the session)."""
+        src = src_getter()
+        items = ['ALL']
+        try:
+            items += [lbl for lbl, _t in (src() if src else [])]
+        except Exception:
+            pass
+        self._scroll_pick(anchor, items,
+                          lambda v: self._an_sel[kind].set(v), height=12)
+
+    def _analyze(self, kind):
+        """Gather the selected target(s) for `kind`, build a bounded prompt and
+        stream the wizard-ai analysis into the chat."""
+        cfg = {
+            'node': (self.node_source, 'node',
+                     "Analyze the following endpoint(s) captured by a web-recon "
+                     "scan for security vulnerabilities. For each, give the likely "
+                     "vulnerability classes, concrete test cases and example "
+                     "payloads, prioritised by impact. Be concise."),
+            'history': (self.history_source, 'history',
+                     "Analyze the following intercepted HTTP transaction(s). Point "
+                     "out injectable parameters, authentication/session and "
+                     "access-control issues, risky headers, and concrete attacks "
+                     "to try with example payloads. Be concise."),
+            'tech': (self.tech_source, 'tech',
+                     "Analyze the following technology fingerprint(s). Summarise "
+                     "the stack, the vulnerability classes and common "
+                     "misconfigurations for each detected technology, CVEs worth "
+                     "checking, and the next recon steps. Be concise."),
+        }[kind]
+        source, noun, instruction = cfg
+        if self._busy or self._closing:
+            return
+        try:
+            items = source() if source else []
+        except Exception:
+            items = []
+        if not items:
+            self._append('Wizard', "There's nothing to analyze yet for the %s "
+                         "target — run a scan or capture some traffic first."
+                         % noun, 'wiz')
+            return
+        sel = self._an_sel[kind].get()
+        if sel and sel != 'ALL':
+            chosen = [it for it in items if it[0] == sel]
+            if not chosen:               # selection went stale → analyse all
+                chosen, sel = items, 'ALL'
+        else:
+            chosen = items
+        # Bound the payload so ALL can't blow the model's context.
+        PER, CAP = 1800, 9000
+        blocks, total = [], 0
+        for i, (lbl, text) in enumerate(chosen, 1):
+            blk = "[%d] %s\n%s" % (i, lbl, (text or '')[:PER])
+            if total + len(blk) > CAP:
+                blocks.append("... (+%d more omitted for length)"
+                              % (len(chosen) - i + 1))
+                break
+            blocks.append(blk)
+            total += len(blk)
+        prompt = instruction + "\n\n" + "\n\n".join(blocks)
+        shown = "Analyze %s: %s" % (
+            noun, ("ALL (%d)" % len(items)) if sel == 'ALL' else sel)
+        self._dispatch(prompt, shown=shown)
+
+    def _dispatch(self, prompt, shown=None):
+        """Append a user turn (showing `shown`, sending `prompt`) and stream the
+        wizard-ai reply. Shared by the chat input and the Analyze buttons."""
+        if self._busy or self._closing:
+            return
+        self._append('You', shown if shown is not None else prompt, 'you')
+        self.history.append({'role': 'user', 'content': prompt})
+        self._busy = True
+        self._first_token = True
+        self._wiz_buf = []
+        self._stream_cancel = False
+        self._q = queue.Queue()
+        try:
+            self.entry.config(state='disabled')   # no Send button — Enter sends
+        except Exception:
+            pass
+        if self.animator is not None:
+            self.animator.go_thinking()
+        threading.Thread(target=self._run_stream, args=(list(self.history),),
+                         daemon=True).start()
+        self._drain()
+
     # ── knowledge-base reference browser ──
-    def _build_kb_panel(self, body):
-        """The far-right column: three vertically stacked dropdowns (phase →
-        module → category) over a read-only pane showing the selected entry's
-        content, drawn from the shared CWES knowledge base."""
+    # ── Test Scheduler (per-node security tests; AI-scheduled via the orb) ──
+    def _build_scheduler_panel(self, body):
+        """Far-right column: a node dropdown selects which node's tests show; the
+        scrying-orb button asks the AI to schedule per-node tests; each completed
+        task shows a green check; Complete / Uncomplete act on the selected task."""
         panel = tk.Frame(body, bg=C['bg'], width=300)
         panel.pack(side='right', fill='y')
         panel.pack_propagate(False)
-        tk.Label(panel, text='Knowledge Base', bg=C['bg'], font=C['font_b'],
-                 anchor='w').pack(fill='x', pady=(8, 4))
+        self._pick_pop = None
+        # Header: title + the scrying-orb AI-schedule button (top right).
+        head = tk.Frame(panel, bg=C['bg'])
+        head.pack(fill='x', pady=(8, 4))
+        tk.Label(head, text='Test Scheduler', bg=C['bg'], font=C['font_b'],
+                 anchor='w').pack(side='left')
+        self._scry_icon = _scrying_orb_photo(20)
+        self.scry_btn = Btn(head, command=self._sched_scry,
+                            **({'image': self._scry_icon} if self._scry_icon
+                               else {'text': ' 🔮 '}))
+        self.scry_btn.pack(side='right')
+        # Node selector — the scrollable menu-style popup (gray, no scrollbar).
+        self.sched_node_btn = Btn(panel, text='Node ▾', anchor='w',
+                                  command=self._sched_open_node_popup)
+        self.sched_node_btn.pack(fill='x', pady=(0, 4))
+        # Task list: each task is one logical line; read-only but selectable.
+        # Selectable list (like the proxy History): a Test column + a State
+        # column, one row per scheduled test.
+        twrap = tk.Frame(panel, bg=C['bg'])
+        twrap.pack(fill='both', expand=True, pady=(0, 4))
+        self.sched_tree = ttk.Treeview(twrap, columns=('test', 'state'),
+                                       show='headings', selectmode='browse',
+                                       height=14)
+        self.sched_tree.heading('test', text='Test')
+        self.sched_tree.heading('state', text='State')
+        # Wide, non-stretching Test column so long test names stay readable by
+        # scrolling horizontally (the panel is narrow).
+        self.sched_tree.column('test', width=320, minwidth=120, anchor='w',
+                               stretch=False)
+        self.sched_tree.column('state', width=54, minwidth=54, anchor='center',
+                               stretch=False)
+        tsb = tk.Scrollbar(twrap, orient='vertical', command=self.sched_tree.yview)
+        hsb = tk.Scrollbar(twrap, orient='horizontal',
+                           command=self.sched_tree.xview)
+        self.sched_tree.config(yscrollcommand=tsb.set, xscrollcommand=hsb.set)
+        hsb.pack(side='bottom', fill='x')
+        tsb.pack(side='right', fill='y')
+        self.sched_tree.pack(side='left', fill='both', expand=True)
+        self.sched_tree.tag_configure('done', foreground='#2e7d32')
+        self.sched_tree.tag_configure('hint', foreground=C['shadow'])
+        # Complete / Uncomplete the selected test (bottom right).
+        bbar = tk.Frame(panel, bg=C['bg'])
+        bbar.pack(fill='x', pady=(0, 8))
+        Btn(bbar, text=' Complete Test ',
+            command=lambda: self._sched_set_done(True)).pack(side='right',
+                                                             padx=(4, 0))
+        Btn(bbar, text=' Uncomplete ',
+            command=lambda: self._sched_set_done(False)).pack(side='right', padx=4)
+        nodes = self._sched_nodes()
+        if self._sched_node not in nodes:
+            self._sched_node = nodes[0] if nodes else None
+        self._sched_render()
 
-        if not (self.kb and self.kb.available()):
-            why = (self.kb.error if self.kb else '') or 'not found'
-            tk.Message(panel, text='CWES knowledge base unavailable:\n' + why,
-                       bg=C['bg'], fg=C['err'], font=C['font'], width=280,
-                       anchor='w', justify='left').pack(fill='x', pady=4)
-            self.kb_content = None
+    def _sched_nodes(self):
+        """Node labels available for scheduling (graph nodes)."""
+        try:
+            return [lbl for lbl, _t in (self.node_source() if self.node_source
+                                        else [])]
+        except Exception:
+            return []
+
+    def _sched_open_node_popup(self):
+        """Open the scrollable node picker under the Node button."""
+        nodes = self._sched_nodes()
+        if not nodes:
+            messagebox.showinfo('No nodes', 'Run a scan first — there are no '
+                                'nodes to schedule tests for.')
+            return
+        self._scroll_pick(self.sched_node_btn, nodes, self._sched_pick_node,
+                          height=12)
+
+    def _sched_pick_node(self, label):
+        self._sched_node = label
+        self._sched_render()
+
+    def _sched_render(self):
+        """Repaint the test list (Treeview) for the current node — one row per
+        test, the State column showing a green ✓ when done."""
+        tree = getattr(self, 'sched_tree', None)
+        if tree is None:
+            return
+        self.sched_node_btn.config(
+            text=((self._sched_node or 'Node')[:34]) + ' ▾')
+        tree.delete(*tree.get_children())
+        tasks = self.schedule.get(self._sched_node, []) if self._sched_node else []
+        if not self._sched_node:
+            tree.insert('', 'end', iid='hint', tags=('hint',),
+                        values=('Pick a node, then click the orb to schedule '
+                                'tests.', ''))
+        elif not tasks:
+            tree.insert('', 'end', iid='hint', tags=('hint',),
+                        values=('No tests yet — click the scrying-orb button to '
+                                'schedule them.', ''))
+        else:
+            for i, t in enumerate(tasks):
+                done = bool(t.get('done'))
+                tree.insert('', 'end', iid=str(i),
+                            values=(t.get('text', ''), '✓' if done else '—'),
+                            tags=('done',) if done else ())
+
+    def _sched_selected_index(self):
+        """Index of the selected test row, or None."""
+        tasks = self.schedule.get(self._sched_node, []) if self._sched_node else []
+        if not tasks:
+            return None
+        sel = self.sched_tree.selection()
+        if not sel:
+            return None
+        try:
+            i = int(sel[0])
+        except ValueError:
+            return None
+        return i if 0 <= i < len(tasks) else None
+
+    def _sched_set_done(self, done):
+        """Mark the selected test done / not done, then celebrate if appropriate."""
+        i = self._sched_selected_index()
+        if i is None:
+            messagebox.showinfo('No test selected', 'Select a test in the list '
+                                'first, then Complete / Uncomplete it.')
+            return
+        self.schedule[self._sched_node][i]['done'] = bool(done)
+        self._sched_render()
+        try:                                # keep the same row selected
+            self.sched_tree.selection_set(str(i))
+            self.sched_tree.see(str(i))
+        except tk.TclError:
+            pass
+        if done:
+            self._sched_celebrate()
+
+    def _sched_celebrate(self):
+        """Applause when every test in the current node is done; the trophy when
+        every test across ALL nodes is done."""
+        if self.animator is None:
             return
 
-        def _mkbtn(label):
-            b = tk.Menubutton(panel, text=label, bg=C['btn'],
-                              activebackground=C['btn'], relief='raised', bd=2,
-                              font=C['font'], padx=6, anchor='w',
-                              highlightthickness=0)
-            m = tk.Menu(b, tearoff=0, bg=C['btn'], fg=C['black'],
-                        activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
-                        font=C['font'])
-            b.config(menu=m)
-            b.pack(fill='x', pady=(0, 4))
-            return b, m
+        def all_done(tasks):
+            return bool(tasks) and all(t.get('done') for t in tasks)
+        with_tasks = [v for v in self.schedule.values() if v]
+        if with_tasks and all(all_done(v) for v in with_tasks):
+            self.animator.react('trophy')
+        elif all_done(self.schedule.get(self._sched_node, [])):
+            self.animator.react('applause')
 
-        self.kb_phase_btn, self.kb_phase_menu = _mkbtn('Phase ▾')
-        self.kb_module_btn, self.kb_module_menu = _mkbtn('Module ▾')
-        self.kb_cat_btn, self.kb_cat_menu = _mkbtn('Category ▾')
-
-        cwrap = tk.Frame(panel, bg=C['bg'])
-        cwrap.pack(fill='both', expand=True, pady=(4, 8))
-        self.kb_content = Text95(cwrap, width=34, height=10, wrap='word',
-                                 bg=C['window'], relief='sunken', bd=2)
-        csb = tk.Scrollbar(cwrap, orient='vertical',
-                           command=self.kb_content.yview)
-        self.kb_content.config(yscrollcommand=csb.set, state='disabled')
-        self.kb_content.pack(side='left', fill='both', expand=True)
-        csb.pack(side='right', fill='y')
-        self.kb_content.tag_config('hdr', font=C['font_b'],
-                                   foreground=C['title_bg'])
-
-        # Populate the phase dropdown; the rest cascade from a selection.
-        for p in self.kb.phases():
-            self.kb_phase_menu.add_command(
-                label=p, command=lambda p=p: self._kb_pick_phase(p))
-        self._kb_set_content('Pick a phase, module and category above to read '
-                             'the reference for that topic.', placeholder=True)
-
-    def _kb_set_content(self, text, header='', placeholder=False):
-        """Replace the read-only content pane's text (re-enabled briefly to edit)."""
-        if not getattr(self, 'kb_content', None):
+    def _sched_scry(self):
+        """Scrying-orb button: ask the AI to schedule per-node tests. It analyses
+        every node + the proxy history + the tech scan and lists, per node, the
+        tests most likely to be real vulns. Gaze (scry loop) while it thinks, then
+        the lightbulb when done."""
+        if self._busy:
             return
-        self.kb_content.config(state='normal')
-        self.kb_content.delete('1.0', 'end')
-        if header:
-            self.kb_content.insert('end', header + '\n\n', 'hdr')
-        self.kb_content.insert('end', text)
-        self.kb_content.config(state='disabled')
-        self.kb_content.yview_moveto(0.0)
+        try:
+            nodes = self.node_source() if self.node_source else []
+        except Exception:
+            nodes = []
+        if not nodes:
+            messagebox.showinfo('No nodes', 'Run a scan first — there are no '
+                                'nodes to schedule tests for.')
+            return
+        nodes = nodes[:30]
+        node_labels = [lbl for lbl, _b in nodes]
 
-    def _kb_pick_phase(self, phase):
-        self._kb_phase, self._kb_module, self._kb_cat = phase, '', ''
-        self.kb_phase_btn.config(text=phase + ' ▾')
-        self.kb_module_btn.config(text='Module ▾')
-        self.kb_cat_btn.config(text='Category ▾')
-        self.kb_module_menu.delete(0, 'end')
-        self.kb_cat_menu.delete(0, 'end')
-        for m in self.kb.modules(phase):
-            self.kb_module_menu.add_command(
-                label=m, command=lambda m=m: self._kb_pick_module(m))
-        self._kb_set_content('Now pick a module within "%s".' % phase,
-                             placeholder=True)
+        def cap_join(src, cap):
+            try:
+                items = src() if src else []
+            except Exception:
+                items = []
+            out, tot = [], 0
+            for lbl, body in items:
+                blk = '%s\n%s' % (lbl, (body or '')[:600])
+                if tot + len(blk) > cap:
+                    break
+                out.append(blk)
+                tot += len(blk)
+            return '\n\n'.join(out)
 
-    def _kb_pick_module(self, module):
-        self._kb_module, self._kb_cat = module, ''
-        self.kb_module_btn.config(text=module + ' ▾')
-        self.kb_cat_btn.config(text='Category ▾')
-        self.kb_cat_menu.delete(0, 'end')
-        for c in self.kb.categories(self._kb_phase, module):
-            self.kb_cat_menu.add_command(
-                label=c, command=lambda c=c: self._kb_pick_cat(c))
-        self._kb_set_content('Now pick a category within "%s".' % module,
-                             placeholder=True)
+        node_block = '\n'.join('%d. %s\n%s' % (i, lbl, (b or '')[:400])
+                               for i, (lbl, b) in enumerate(nodes, 1))
+        hist = cap_join(self.history_source, 3000)
+        tech = cap_join(self.tech_source, 2000)
+        prompt = (
+            "Schedule security tests for an AUTHORISED web-app assessment. For "
+            "EVERY numbered node below, list SEVERAL (3-6) concrete tests that are "
+            "REASONABLE and APPLICABLE to THAT specific node and MOST LIKELY to "
+            "reveal a REAL vulnerability — prioritise by likelihood, and be "
+            "specific (name the parameter / header / endpoint / technique). Do NOT "
+            "invent tests for things the node doesn't have. Use ALL the evidence: "
+            "the nodes, the intercepted traffic and the tech stack. Output ONLY "
+            "lines in EXACTLY this format, nothing else, no headers, no prose:\n"
+            "[<node number>] <one concise test>\n\nNODES:\n"
+            + node_block
+            + (("\n\nINTERCEPTED TRAFFIC:\n" + hist) if hist else '')
+            + (("\n\nTECH FINGERPRINT:\n" + tech) if tech else ''))
+        self._busy = True
+        if self.animator is not None:
+            self.animator.react('scry')         # gaze into the orb while thinking
+        # Run the model on a worker thread; deliver the result via a queue drained
+        # on the UI thread (calling Tk from the worker thread would deadlock).
+        self._scry_q = queue.Queue()
 
-    def _kb_pick_cat(self, category):
-        self._kb_cat = category
-        self.kb_cat_btn.config(text=category + ' ▾')
-        body = self.kb.content(self._kb_phase, self._kb_module, category)
-        self._kb_set_content(body or '(no content for this category)',
-                             header=category)
+        def worker():
+            full = self.ai.chat_stream(
+                self._context_messages()
+                + [{'role': 'user', 'content': prompt}],
+                model=self.model, on_token=None,
+                is_cancelled=lambda: self._closing)
+            self._scry_q.put((full, node_labels))
+        threading.Thread(target=worker, daemon=True).start()
+        self._scry_poll()
 
-    def _kb_selected_content(self, cap=6000):
-        """The category the seeker is currently reading, capped for injection as
-        chat context — empty when nothing (or only a placeholder) is selected."""
-        if not (self.kb and self._kb_cat):
-            return ''
-        body = self.kb.content(self._kb_phase, self._kb_module, self._kb_cat)
-        if not body:
-            return ''
-        clipped = body[:cap]
-        return ("%s > %s > %s\n%s" % (self._kb_phase, self._kb_module,
-                                      self._kb_cat, clipped))
+    def _scry_poll(self):
+        """UI-thread poll for the AI scheduling result; lightbulb + apply on done."""
+        try:
+            full, node_labels = self._scry_q.get_nowait()
+        except queue.Empty:
+            if self._busy and not self._closing:
+                self.after(120, self._scry_poll)
+            return
+        self._busy = False
+        if self.animator is not None:
+            self.animator.react('scry_done')        # lightbulb idea
+        if not self._closing:
+            self._sched_apply_ai(full, node_labels)
+
+    def _sched_apply_ai(self, text, node_labels):
+        """Parse the AI's '[n] test' lines into per-node tests and add them to the
+        schedule (existing tests + their done-state are preserved)."""
+        if not text or text.startswith('[AI error') or text.startswith('[Ollama'):
+            messagebox.showinfo('Scheduling failed',
+                                text or 'No response from the AI.')
+            return
+        found = {}
+        for m in re.finditer(r'(?m)^\s*\[?(\d{1,3})\]?[.):\-]?\s+(.+?)\s*$', text):
+            n = int(m.group(1))
+            t = re.sub(r'^[\-•*\s]+', '', m.group(2)).strip()
+            if 1 <= n <= len(node_labels) and t and len(t) > 3:
+                found.setdefault(node_labels[n - 1], []).append(t)
+        added = 0
+        for lbl, tests in found.items():
+            cur = self.schedule.setdefault(lbl, [])
+            have = {x['text'] for x in cur}
+            for t in tests:
+                if t not in have:
+                    cur.append({'text': t, 'done': False})
+                    have.add(t)
+                    added += 1
+        if not added:
+            messagebox.showinfo('Scheduling',
+                                'The wizard returned no tests it could schedule. '
+                                'Try the orb again.')
+            return
+        if self._sched_node not in found:
+            self._sched_node = next(iter(found))
+        self._sched_render()
+
+    def _scroll_pick(self, anchor, items, on_pick, height=12):
+        """Pop a scrollable list under `anchor`, styled like the app's other menus
+        (gray, raised border — NOT a sunken text box): shows at most `height` rows
+        (the rest scroll), highlights the row under the cursor like a menu, calls
+        `on_pick(value)` on selection, and dismisses on Escape, focus-out or
+        selection. Used for long dropdowns (the attack list) where a plain Menu
+        would be unusably tall."""
+        old = getattr(self, '_pick_pop', None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+            self._pick_pop = None
+        items = list(items or [])
+        if not items:
+            return
+        top = tk.Toplevel(self, bg=C['btn'])
+        self._pick_pop = top
+        top.overrideredirect(True)
+        # Raised gray border so it reads as a MENU, like the app's other dropdowns.
+        inner = tk.Frame(top, bg=C['btn'], relief='raised', bd=2)
+        inner.pack()
+        width = max(16, min(34, max(len(s) for s in items) + 1))
+        # The list itself is the menu grey (C['btn']) with no border — so it looks
+        # like a menu, not a sunken text field.
+        lb = tk.Listbox(inner, height=min(height, len(items)), width=width,
+                        bg=C['btn'], fg=C['black'], font=C['font'],
+                        activestyle='none', selectbackground=C['sel_bg'],
+                        selectforeground=C['sel_fg'], relief='flat', bd=0,
+                        highlightthickness=0, exportselection=False)
+        for it in items:
+            lb.insert('end', it)
+        # No scrollbar — scrolling is by mouse wheel (and arrow keys) only, bound
+        # below, so the popup stays a clean menu.
+        lb.pack(fill='both', expand=True)
+
+        # Menu-like hover: highlight the row under the pointer as the mouse moves.
+        def _hover(e):
+            i = lb.nearest(e.y)
+            if i >= 0:
+                lb.selection_clear(0, 'end')
+                lb.selection_set(i)
+                lb.activate(i)
+        lb.bind('<Motion>', _hover)
+
+        outside_id = [None]
+
+        def close():
+            if getattr(self, '_pick_pop', None) is top:
+                self._pick_pop = None
+            if outside_id[0] is not None:
+                try:
+                    self.unbind('<Button-1>', outside_id[0])
+                except Exception:
+                    pass
+                outside_id[0] = None
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+        def choose(_e=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            val = items[sel[0]]
+            close()
+            on_pick(val)
+
+        lb.bind('<ButtonRelease-1>', choose)
+        lb.bind('<Return>', choose)
+        lb.bind('<Escape>', lambda _e: close())
+        top.bind('<Escape>', lambda _e: close())
+        lb.bind('<Button-4>', lambda _e: lb.yview_scroll(-1, 'units'))
+        lb.bind('<Button-5>', lambda _e: lb.yview_scroll(1, 'units'))
+        lb.bind('<MouseWheel>',
+                lambda e: lb.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
+
+        # Auto-close when the pointer leaves the popup (same feel as the dropdown
+        # menus). A short grace + enter-cancel means moving between its own widgets
+        # or scrolling won't dismiss it — only leaving the whole popup does. The
+        # anchor is a plain Btn, so clicking it reopens cleanly (no stale state).
+        leave_after = [None]
+
+        def _cancel_leave(_e=None):
+            if leave_after[0] is not None:
+                try:
+                    self.after_cancel(leave_after[0])
+                except Exception:
+                    pass
+                leave_after[0] = None
+
+        def _schedule_leave(_e=None):
+            _cancel_leave()
+            try:
+                leave_after[0] = self.after(200, close)
+            except Exception:
+                pass
+
+        for w in (top, inner, lb):
+            w.bind('<Enter>', _cancel_leave, add='+')
+            w.bind('<Leave>', _schedule_leave, add='+')
+
+        # Dismiss on a click OUTSIDE the popup — NOT on focus-out. A focus-
+        # follows-mouse WM fires <FocusOut> just from moving the cursor, which was
+        # closing the menu on every mouse move (the close/work/close pattern).
+        # Clicks inside the listbox live in a separate toplevel, so they don't
+        # trigger this dialog-level binding.
+        def _click_outside(e):
+            t = getattr(self, '_pick_pop', None)
+            if t is None:
+                return
+            try:
+                wx, wy = t.winfo_rootx(), t.winfo_rooty()
+                inside = (wx <= e.x_root < wx + t.winfo_width()
+                          and wy <= e.y_root < wy + t.winfo_height())
+            except tk.TclError:
+                inside = False
+            if not inside:
+                close()
+
+        anchor.update_idletasks()
+        x = anchor.winfo_rootx()
+        y = anchor.winfo_rooty() + anchor.winfo_height()
+        top.geometry('+%d+%d' % (x, y))
+        top.lift()
+        lb.focus_set()
+        outside_id[0] = self.bind('<Button-1>', _click_outside, add='+')
+
+    # ── lightweight markdown rendering (chat + KB pane) ──
+    _MD_FENCE = re.compile(r'```[ \t]*[\w.+-]*[ \t]*\n?(.*?)```', re.DOTALL)
+    _MD_SPAN = re.compile(r'`([^`]+)`|\*\*([^*]+?)\*\*')
+
+    def _render_md(self, widget, text, base=None):
+        """Insert `text` into a Text widget applying lightweight markdown: fenced
+        ```code``` blocks and inline `code` render monospace (the 'code' tag),
+        **bold** renders bold, and lines indented 2+ spaces render as code too.
+        `base` is an optional tag applied to plain runs. The widget must already
+        be in the 'normal' state."""
+        pos = 0
+        for m in self._MD_FENCE.finditer(text):
+            self._render_md_inline(widget, text[pos:m.start()], base)
+            code = m.group(1).strip('\n')
+            widget.insert('end', code + '\n', ('code',))
+            pos = m.end()
+        self._render_md_inline(widget, text[pos:], base)
+
+    def _render_md_inline(self, widget, text, base):
+        """Render a non-fenced run: indented lines as code blocks, otherwise
+        inline `code` / **bold** spans."""
+        for line in text.splitlines(keepends=True):
+            body = line.rstrip('\n')
+            if body.strip() and len(body) - len(body.lstrip(' ')) >= 2:
+                widget.insert('end', line, ('code',))   # indented payload/example
+                continue
+            last = 0
+            for m in self._MD_SPAN.finditer(line):
+                if m.start() > last:
+                    widget.insert('end', line[last:m.start()],
+                                  (base,) if base else ())
+                if m.group(1) is not None:
+                    widget.insert('end', m.group(1), ('code',))
+                else:
+                    widget.insert('end', m.group(2), ('bold',))
+                last = m.end()
+            if last < len(line):
+                widget.insert('end', line[last:], (base,) if base else ())
 
     @staticmethod
     def _round_rect(x1, y1, x2, y2, r):
@@ -13435,9 +16049,7 @@ class WizardAssistantDialog(tk.Toplevel):
 
     def _kb_context_messages(self):
         """Silent priming that grounds the Wizard in the shared CWES knowledge
-        base: a compact topic index (what it can draw on) plus — when the seeker
-        has a category open in the reference browser — that entry's content, so
-        questions about what they're reading get deep, KB-grounded answers."""
+        base: a compact topic index of what it can draw on."""
         if not (self.kb and self.kb.available()):
             return []
         idx = self.kb.index_text()
@@ -13446,15 +16058,10 @@ class WizardAssistantDialog(tk.Toplevel):
         block = ("(KNOWLEDGE BASE — you have a CWES Web-Pentest reference. Use "
                  "it to ground your guidance; do not invent topics it does not "
                  "cover. Index of what it holds:)\n\n" + idx)
-        reading = self._kb_selected_content()
-        if reading:
-            block += ("\n\n(The seeker is currently reading this entry — prefer "
-                      "it when they ask about this topic:)\n\n" + reading)
         return [
             {'role': 'user', 'content': block},
             {'role': 'assistant', 'content':
-                "Understood — I'll ground my counsel in the CWES reference and "
-                "lean on whatever passage you're studying."},
+                "Understood — I'll ground my counsel in the CWES reference."},
         ]
 
     def _context_messages(self):
@@ -13490,19 +16097,7 @@ class WizardAssistantDialog(tk.Toplevel):
         if not text:
             return
         self.input_var.set('')
-        self._append('You', text, 'you')
-        self.history.append({'role': 'user', 'content': text})
-        self._busy = True
-        self._first_token = True
-        self._wiz_buf = []
-        self._stream_cancel = False
-        self._q = queue.Queue()
-        self.entry.config(state='disabled')   # no Send button — Enter sends
-        # listening → readreturn → thinking cycle (or straight to thinking).
-        self.animator.go_thinking()
-        threading.Thread(target=self._run_stream, args=(list(self.history),),
-                         daemon=True).start()
-        self._drain()
+        self._dispatch(text)
 
     def _run_stream(self, history):
         """Worker thread: stream into a thread-safe queue (never touches Tk). The
@@ -13530,12 +16125,16 @@ class WizardAssistantDialog(tk.Toplevel):
             self.after(30, self._drain)
 
     def _on_token(self, chunk):
-        """First chunk: thinking → sending + open the wizard's line; then stream."""
+        """First chunk: thinking → sending + open the wizard's line; then stream
+        the raw text live (it's re-rendered with code formatting on completion)."""
         if self._closing:
             return
         if self._first_token:
             self._first_token = False
             self.transcript.insert('end', 'Wizard: ', 'wiz')
+            # Mark where the body begins so it can be reformatted when complete.
+            self.transcript.mark_set('wiz_body', 'end-1c')
+            self.transcript.mark_gravity('wiz_body', 'left')
             self.transcript.see('end')
             self.animator.thinking_to_sending()
         self._wiz_buf.append(chunk)
@@ -13543,18 +16142,29 @@ class WizardAssistantDialog(tk.Toplevel):
         self.transcript.see('end')
 
     def _on_done(self, full):
-        """Stream finished: close the line, record it, play the sending outro."""
+        """Stream finished: re-render the reply with code formatting, record it,
+        play the sending outro."""
         if self._closing:
             return
-        if self._first_token:
+        reply = ''.join(self._wiz_buf) or full or ''
+        ok = bool(reply) and not reply.startswith('[AI error') \
+            and not reply.startswith('[Ollama')
+        if self._first_token:               # nothing streamed — open the line now
             self.transcript.insert('end', 'Wizard: ', 'wiz')
-            self.transcript.insert('end', full or '…')
+            self.transcript.mark_set('wiz_body', 'end-1c')
+            self.transcript.mark_gravity('wiz_body', 'left')
+            self.transcript.insert('end', reply or '…')
             self.animator.thinking_to_sending()
+        # Replace the raw streamed body with a code-formatted render.
+        try:
+            self.transcript.delete('wiz_body', 'end-1c')
+            self._render_md(self.transcript, reply or '…')
+            self.transcript.mark_unset('wiz_body')
+        except tk.TclError:
+            pass
         self.transcript.insert('end', '\n\n')
         self.transcript.see('end')
-        reply = ''.join(self._wiz_buf) or full
-        if reply and not reply.startswith('[AI error') \
-                and not reply.startswith('[Ollama'):
+        if ok:
             self.history.append({'role': 'assistant', 'content': reply})
             # Append the exchange to the raw chat-history log and keep the live
             # session context bounded. (Distilled memory is refreshed on close.)
@@ -13659,6 +16269,27 @@ def wizard_react(kind='magic'):
     if cb:
         try:
             cb(kind)
+        except Exception:
+            pass
+
+
+_HISTORY_SINK = None
+
+
+def set_history_sink(cb):
+    """Install the handler that records a Repeater/Fuzzer send into the proxy
+    history (called once by the app, pointing at ProxyPanel.record_external)."""
+    global _HISTORY_SINK
+    _HISTORY_SINK = cb
+
+
+def record_history(raw, base_url, response, response_text, source='repeater'):
+    """A Repeater ('repeater') or Fuzzer ('fuzzer') send completed — log it to the
+    proxy history (the Type column shows R / F). No-op if no sink is installed."""
+    cb = _HISTORY_SINK
+    if cb:
+        try:
+            cb(raw, base_url, response, response_text, source)
         except Exception:
             pass
 
@@ -13856,6 +16487,8 @@ class gui:
         app.stop_btn.pack(side='left', padx=2)
         app.progress = Chicago95Progress(bot, width=150, height=16)
         app.progress.pack(side='left', padx=6)
+        # Single state box right of the loading bar: yellow pause (paused on an
+        # intercepted request), green check (concluded) or red X (failed).
         app.status_box = StatusBox(bot, size=18)
         app.status_box.pack(side='left', padx=2)
         Btn(bot, text='⚙ Settings',
@@ -13980,8 +16613,15 @@ class gui:
         app.proxy_panel = ProxyPanel(top, controller=app.proxy,
                                      on_open_browser=app._open_browser,
                                      on_save_node=app._save_proxy_saved_node,
-                                     on_repeat_node=app._repeat_proxy_saved_node)
+                                     on_repeat_node=app._repeat_proxy_saved_node,
+                                     on_fuzz_node=app._fuzz_proxy_saved_node,
+                                     is_scan_active=app._scan_active,
+                                     on_intercept_change=app._on_intercept_change)
         app.proxy_panel.pack(side='left', fill='both', expand=True, padx=(4, 0))
+        # Scan ↔ intercept are mutually exclusive: sync the button lock now.
+        app._lock_scan_intercept()
+        # Repeater (R) and Fuzzer (F) sends are logged into the proxy history.
+        set_history_sink(app.proxy_panel.record_external)
         # Shrink the left column to fit the dropdown row exactly (symmetric gaps).
         self.root.after(120, self._fit_site_structure)
         # Let the graph's right-click node menu drive the inspector's tools, and
@@ -14045,7 +16685,7 @@ class app:
                 pass
 
         self.ai = ollama(
-            model=self.settings.get('model', 'reconner-ai'),
+            model=self.settings.get('wizard_model', 'wizard-ai'),
             host=self.settings.get('ollama_host', ''),
             temperature=self.settings.get('temperature', 0.7),
         )
@@ -14176,9 +16816,20 @@ class app:
                 pass
 
     def _proxy_show(self, flow):
-        """Controller hook (UI thread): paint the trapped flow in the proxy panel."""
+        """Controller hook (UI thread): paint the trapped flow in the proxy panel
+        and reflect the scan-paused state in the single state box by the loading
+        bar — a yellow pause symbol while a request is held, cleared once the user
+        forwards or drops it (which re-fires this with the next flow, or None when
+        the queue empties). Only a pause is cleared, so a concluded/failed badge
+        from a finished scan is never erased."""
         if getattr(self, 'proxy_panel', None) is not None:
             self.proxy_panel.show_item(flow)
+        sb = getattr(self, 'status_box', None)
+        if sb is not None and not getattr(self, '_scan_complete', False):
+            if flow is not None:
+                sb.pause()
+            elif sb.state == 'pause':
+                sb.clear()
 
     def _proxy_status(self, msg):
         """Controller hook (UI thread): reflect a proxy status line and re-sync the
@@ -14198,8 +16849,16 @@ class app:
             except Exception:
                 pass
         try:
+            # Nest the same way the scanner does — by user-like navigation. The
+            # browser's Referer header is the page this request was made FROM, so
+            # it's the graph parent (subresources/XHR nest under their page, pages
+            # under the page that linked to them). No/own Referer → a root node.
+            ref = next((v for k, v in (flow.req_headers or {}).items()
+                        if k.lower() == 'referer'), '') or ''
+            ref = ref.split('#', 1)[0].strip()
+            parent = ref if (ref and ref != flow.url) else None
             node = SiteNode(url=flow.url, node_type=self._proxy_node_type(flow),
-                            parent_url=None)
+                            parent_url=parent)
             node.req_method  = flow.method
             node.req_url     = flow.url
             node.req_headers = dict(flow.req_headers)
@@ -14240,20 +16899,27 @@ class app:
             return 'endpoint'
         return 'page'
 
+    # ── Show-Element popup (one reused window) ───────────────────────
     # ── open the system browser through the proxy ────────────────────
     def _open_browser(self):
         """Launch the system browser routed through the proxy (CA trusted) so the
-        user can browse and the proxy intercepts. Best-effort across Firefox then
-        Chromium; falls back to a message with the CA path + manual steps."""
+        user can browse and the proxy intercepts. While the browser is open the
+        proxy injects a live overlay that draws a red rectangle over each element
+        as it is used (the whole form when the element belongs to one). Best-effort
+        across Firefox then Chromium; falls back to a message with the CA path +
+        manual steps."""
         self.proxy.start()
         port = self.proxy.port
-        # Open the target if one is set, otherwise launch with no page (the
-        # browser's own home/blank page) — don't force an example site.
-        url = self.target_var.get().strip()
+        # Open the SELECTED node's URL if one is selected, else the target if set,
+        # otherwise launch with no page (the browser's own home/blank page) — don't
+        # force an example site.
+        node = getattr(self.info_panel, 'node', None)
+        url = (node.url if node is not None
+               else self.target_var.get().strip())
         try:
-            if self._launch_firefox(url, port):
-                return
-            if self._launch_chromium(url, port):
+            if self._launch_firefox(url, port) or self._launch_chromium(url, port):
+                self.proxy.highlight_browser = True   # proxy injects the overlay
+                self._watch_browser_proc()            # off again when it closes
                 return
         except Exception as e:
             self._status(f'Browser launch error: {e}')
@@ -14262,6 +16928,18 @@ class app:
             'Could not auto-launch a browser through the proxy.\n\n'
             f'Point your browser at proxy 127.0.0.1:{port} and trust the CA at:\n'
             f'{PROXY_CA_CERT}')
+
+    def _watch_browser_proc(self):
+        """Poll the manual-explore browser process; once it exits, stop the proxy's
+        element-highlight injection so ordinary scan traffic isn't rewritten."""
+        proc = getattr(self, '_browser_proc', None)
+        if proc is not None and proc.poll() is None:
+            self.root.after(1500, self._watch_browser_proc)
+            return
+        try:
+            self.proxy.highlight_browser = False
+        except Exception:
+            pass
 
     def _launch_firefox(self, url, port):
         """Launch Firefox/Firefox-ESR in a dedicated Reconner profile configured
@@ -14420,7 +17098,7 @@ class app:
         """Apply newly-saved settings: update the AI client, concurrency limits and
         the proxy port (restarting the listener if it changed)."""
         self.settings = s
-        self.ai.model = s.get('model', 'reconner-ai')
+        self.ai.model = s.get('wizard_model', 'wizard-ai')
         self.ai.host = s.get('ollama_host', '')
         self.ai.temperature = s.get('temperature', 0.7)
         # Live-update an open Wizard so its next reply uses the new model.
@@ -14477,8 +17155,7 @@ class app:
 
         if self._fp_popup is None or not self._fp_popup.winfo_exists():
             self._fp_popup = FingerprintDialog(
-                self.root, current, on_analyze=self._analyze_fp_request,
-                on_select=self._fp_select_host)
+                self.root, current, on_select=self._fp_select_host)
         else:
             self._fp_popup.lift()
             self._fp_popup.focus_force()
@@ -14494,62 +17171,12 @@ class app:
         cached = self.fingerprint_cache.get(target)
         if cached and cached.get('fp'):
             self._fp_popup.set_fingerprint(cached['fp'])
-            self._fp_popup.set_ai(self._ai_display(cached))
             self._status(f'Tech Scan: {target}')
         else:
             self._fp_popup.set_fingerprint(
                 'No tech scan yet for this host.\n\n'
                 'The tech scan runs automatically when you click SCAN TARGET — '
                 'run a scan, then reopen this to view the detected technologies.')
-            self._fp_popup.set_ai('(run a target scan first)')
-
-    @staticmethod
-    def _ai_display(entry):
-        """Text to show in the AI pane given a cache entry's analysis state."""
-        if entry.get('ai'):
-            return entry['ai']
-        if entry.get('ai_running'):
-            return 'Analyzing… please wait.'
-        return 'Click "Analyze with AI" for security insights.'
-
-    def _analyze_fp_request(self):
-        """Triggered by the Tech Scan popup's Analyze button — analyse the
-        target the popup is showing."""
-        if self._fp_popup is not None and self._fp_popup.winfo_exists():
-            self._analyze_fp(self._fp_popup.target)
-
-    def _analyze_fp(self, target):
-        """Run (or re-show) the AI analysis for a target. The work runs in the
-        background and writes its state to fingerprint_cache, so it keeps going
-        and is recoverable even if the popup is closed and reopened later."""
-        entry = self.fingerprint_cache.get(target)
-        if not entry or not entry.get('fp'):
-            return
-        if entry.get('ai') or entry.get('ai_running'):
-            self._show_fp_ai(target, self._ai_display(entry))
-            return
-        entry['ai_running'] = True
-        fp_text = entry['fp']
-        self._show_fp_ai(target, 'Analyzing… please wait.')
-
-        def run():
-            """Worker: analyse the fingerprint, cache the result, and show it."""
-            try:
-                insight = self.ai.analyze_fingerprint(fp_text)
-            except Exception as e:
-                insight = f'AI analysis error: {e}'
-            entry['ai'] = insight
-            entry['ai_running'] = False
-            self.root.after(0, lambda: self._show_fp_ai(target, insight))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _show_fp_ai(self, target, text):
-        """Update the Tech Scan popup's AI pane only if it's still showing this
-        target (so a background result never lands in the wrong popup)."""
-        if (self._fp_popup is not None and self._fp_popup.winfo_exists()
-                and self._fp_popup.target == target):
-            self._fp_popup.set_ai(text)
 
     def _run_tech_scan(self, target, mode=None, reset_cancel=True):
         """Run the tech scan in the background as part of a target scan and cache
@@ -14707,6 +17334,11 @@ class app:
         any result it saves becomes an edited graph node."""
         inspector.repeater(self.root, node, on_save=self._add_edited_node)
 
+    def _fuzz_proxy_saved_node(self, node: SiteNode):
+        """Open the Fuzzer seeded with a node built from a proxied transaction;
+        any result it saves becomes an edited graph node."""
+        inspector.fuzzer(self.root, node, on_save=self._add_edited_node)
+
     def _open_wizard(self):
         """Open (or focus) the animated Wizard assistant. The MerlinAgent (sprite)
         is parsed once and reused; the dialog is a singleton and streams from the
@@ -14718,11 +17350,83 @@ class app:
             return
         if getattr(self, '_merlin_agent', None) is None:
             self._merlin_agent = MerlinAgent(scale=1.4)   # a bit bigger wizard
+        # App-owned per-node test schedule so it survives re-opening the popup.
+        if not hasattr(self, '_test_schedule'):
+            self._test_schedule = {}
         self._wizard_win = WizardAssistantDialog(
             self.root, self._merlin_agent, self.ai,
             model=self.settings.get('wizard_model', 'wizard-ai'),
             geometry=self.settings.get('wizard_geometry', ''),
-            on_geometry=self._save_wizard_geometry)
+            on_geometry=self._save_wizard_geometry,
+            node_source=self._wizard_node_items,
+            history_source=self._wizard_history_items,
+            tech_source=self._wizard_tech_items,
+            schedule=self._test_schedule)
+
+    # ── data sources for the Wizard's Analyze buttons ──
+    @staticmethod
+    def _wizard_node_brief(node) -> str:
+        """A compact, security-relevant brief of a graph node for AI analysis."""
+        parts = [
+            f"URL: {node.url}",
+            f"Type: {node.node_type}",
+            f"Status: {node_status_label(node)}",
+            f"Content-Type: {node.content_type or '-'}",
+            f"Title: {node.title or '-'}",
+        ]
+        if getattr(node, 'get_params', None):
+            parts.append(f"GET params: {json.dumps(node.get_params)[:400]}")
+        if getattr(node, 'forms', None):
+            parts.append(f"Forms: {json.dumps(node.forms)[:600]}")
+        hdrs = dict(list((node.headers or {}).items())[:8])
+        if hdrs:
+            parts.append(f"Headers: {json.dumps(hdrs)[:400]}")
+        snippet = (node.text_content or '')[:500]
+        if snippet:
+            parts.append(f"Page snippet:\n{snippet}")
+        return '\n'.join(parts)
+
+    def _wizard_node_items(self):
+        """(label, brief) per graph node — the targets for Analyze Node."""
+        out = []
+        for url, node in list(self.graph_panel.nodes.items()):
+            out.append((f"{node.node_type}: {url}", self._wizard_node_brief(node)))
+        return out
+
+    @staticmethod
+    def _wizard_history_brief(rec) -> str:
+        """A compact request/response transcript of a proxy-history record."""
+        lines = [f"{rec.get('method', 'GET')} {rec.get('url', '')}"]
+        for k, v in list((rec.get('req_headers') or {}).items())[:10]:
+            lines.append(f"{k}: {v}")
+        if rec.get('req_body'):
+            lines += ['', 'Request body: ' + str(rec['req_body'])[:800]]
+        lines += ['', f"-> {rec.get('status', '')} {rec.get('reason', '')}"]
+        for k, v in list((rec.get('resp_headers') or {}).items())[:10]:
+            lines.append(f"{k}: {v}")
+        if rec.get('resp_body'):
+            lines += ['', 'Response body: ' + str(rec['resp_body'])[:800]]
+        return '\n'.join(lines)
+
+    def _wizard_history_items(self):
+        """(label, transcript) per proxy-history record — targets for Analyze History."""
+        out = []
+        for rec in list(getattr(self.proxy_panel, 'history', []) or []):
+            label = (f"{rec.get('method', '?')} {rec.get('url', '')}  "
+                     f"[{rec.get('status', '')}]")
+            out.append((label, self._wizard_history_brief(rec)))
+        return out
+
+    def _wizard_tech_items(self):
+        """(host, fingerprint) per scanned host — targets for Analyze Tech."""
+        out = []
+        for target, entry in list(self.fingerprint_cache.items()):
+            fp = (entry or {}).get('fp')
+            if not fp:
+                continue
+            host = _host_only(urlparse(target).netloc) or target
+            out.append((host, fp[:4000]))
+        return out
 
     def _save_wizard_geometry(self, geom):
         """Remember the Wizard popup's last position/size for the next open."""
@@ -14788,6 +17492,34 @@ class app:
                 return None
             return box.get('cred')
 
+    def _scan_active(self) -> bool:
+        """True while a scan (primary and/or subdomain) is running. Used to block
+        proxy intercept — the scanner and the interceptor can't run together."""
+        return getattr(self, '_active_scans', 0) > 0
+
+    def _lock_scan_intercept(self):
+        """Scan and proxy intercept are mutually exclusive — grey out whichever
+        control must not be used right now: the Intercept toggle while a scan is
+        running, and SCAN TARGET while intercept is ON."""
+        scanning = self._scan_active()
+        intercept_on = bool(self.proxy is not None and self.proxy.intercept)
+        try:
+            self.scan_btn.config(
+                state='disabled' if (scanning or intercept_on) else 'normal')
+        except (tk.TclError, AttributeError):
+            pass
+        pp = getattr(self, 'proxy_panel', None)
+        if pp is not None:
+            pp.set_intercept_locked(scanning)
+
+    def _on_intercept_change(self, on):
+        """Called by the ProxyPanel when intercept is toggled. Safeguard: if it
+        went ON while a scan is running, kill the scan; then re-sync the
+        scan/intercept button locks."""
+        if on and self._scan_active():
+            self._scan_stop()
+        self._lock_scan_intercept()
+
     def _scan_start(self):
         """Start a scan of the target URL: reset the graph and per-scan state,
         build the scanner with the chosen mode/scope/auth options, and run it on
@@ -14796,22 +17528,32 @@ class app:
         if not target:
             messagebox.showwarning('No Target', 'Enter a target URL.')
             return
+        # The scanner and the proxy intercept can't run together. If intercept is
+        # on, block the scan (turn intercept off first).
+        if self.proxy is not None and self.proxy.intercept:
+            messagebox.showinfo(
+                'Intercept is on',
+                "Proxy intercept is ON. Turn it OFF before scanning — the scanner "
+                "and the interceptor can't run at the same time.")
+            return
 
-        # Complement vs fresh: if the target host already has a populated graph,
-        # KEEP it and let this scan add to it — so a Browser crawl and a Fuzzing
-        # pass (in either order) build up the SAME graph, each completing the
-        # other. A scan of a new/empty target host starts fresh (clears). Use the
-        # graph's Options ▸ Clear to force a clean slate on a re-scan.
+        # Clear ONLY when the target URL changes. Re-scanning the SAME target —
+        # e.g. a Browser crawl then a Fuzzing pass (in either order) — KEEPS the
+        # graph and adds to it, so the two scanners build up one graph and
+        # complement each other. Switching to a different target URL starts fresh.
+        # (Use the graph's Options ▸ Clear to force a clean slate manually.)
         host = self.graph_panel._host_of(target)
         existing = self.graph_panel.graphs.get(host)
-        complement = bool(existing and existing.get('nodes'))
+        same_target = (getattr(self, '_last_scan_target', None) == target)
         # Read the user's scope before clear() resets the field.
         scope = self.graph_panel.scope_text()
-        if complement:
-            self.graph_panel._activate(host)   # show/aggregate onto this graph
-            self._status(f'Complementing existing graph for {host}')
+        if same_target:
+            if existing:
+                self.graph_panel._activate(host)   # show/aggregate onto this graph
+            self._status(f'Adding to the existing graph for {host}')
         else:
             self.graph_panel.clear()
+        self._last_scan_target = target
         # Pre-create the entry host's graph as the active/primary one, so a
         # subdomain discovered first (e.g. crt.sh in Aggressive mode) can't claim
         # the primary slot before the target's own nodes arrive. Restore the
@@ -14841,10 +17583,17 @@ class app:
             self.proxy.set_scope(scope)
         proxy_addr = f'127.0.0.1:{self.proxy.port}' if intercept else None
         unsafe = intercept
+        # `unsafe` is read LIVE from the proxy's intercept state, so toggling the
+        # proxy mid-scan flips the crawl between full-surface (proxy ON: fill every
+        # field, click every control, no whitelist/heuristics) and safe (proxy
+        # OFF: whitelist + destructive/safe-click heuristics). The whitelist is
+        # kept (not nulled) so it re-applies the moment the proxy goes off.
+        unsafe_cb = lambda: bool(self.proxy is not None and self.proxy.intercept)
         if intercept:
-            whitelist = None
-            self._status('Intercept ON — crawl runs UNSAFE (no whitelist / safe '
-                         'heuristics); vet each request in the Proxy panel.')
+            self._status('Intercept ON — crawl runs FULL-SURFACE (fills/clicks '
+                         'everything, no whitelist/heuristics); turn the proxy off '
+                         'mid-scan to restore safe heuristics. Vet each request in '
+                         'the Proxy panel.')
         # Per-host credential store, shared with sub-scans so a credential entered
         # once is reused everywhere for that host. Reset each scan (session-only).
         self._host_auth = {}
@@ -14853,7 +17602,7 @@ class app:
         self._scan_params = {
             'mode': mode, 'scope': scope, 'auth_scan': auth_scan,
             'whitelist': whitelist, 'scan_type': scan_type,
-            'proxy': proxy_addr, 'unsafe': unsafe,
+            'proxy': proxy_addr, 'unsafe': unsafe, 'unsafe_cb': unsafe_cb,
         }
         self._sub_scanners = []
         self._sub_hosts = set()
@@ -14879,9 +17628,12 @@ class app:
             scan_type=scan_type,
             proxy=proxy_addr,
             unsafe=unsafe,
+            unsafe_cb=unsafe_cb,
         )
         self.scan_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
+        self._lock_scan_intercept()     # grey out the Intercept toggle for the run
+        self._scan_complete = False     # gates the proxy pause indicator
         self.status_box.clear()
         self.progress.start()
         self._status(f'Scanning ({mode} · {scan_type}): {target}')
@@ -14910,6 +17662,7 @@ class app:
         self._tech_cancelled = True
         self.scan_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
+        self._lock_scan_intercept()     # re-enable Intercept now the scan is gone
         self.graph_panel.set_scanning(False)
 
     def _got_node(self, node: SiteNode):
@@ -14925,6 +17678,12 @@ class app:
                 return
             self.graph_panel.add_node(node)
             self.count_var.set(f'Nodes: {len(self.graph_panel.nodes)}')
+            # Log the scan-captured request into the proxy history (Type 'S').
+            # Skip seeded-but-not-sent nodes — those weren't actually requested.
+            if (getattr(self, 'proxy_panel', None) is not None
+                    and getattr(node, 'probe_state', 'ok') != 'unsent'
+                    and (node.req_method or node.resp_status is not None)):
+                self.proxy_panel.record_node(node, 'scan')
         self.root.after(0, ui)
 
     def _got_subdomain(self, host):
@@ -14974,6 +17733,7 @@ class app:
                 scan_type=p.get('scan_type', 'browser'),
                 proxy=p.get('proxy'),
                 unsafe=p.get('unsafe', False),
+                unsafe_cb=p.get('unsafe_cb'),
             )
             self._sub_scanners.append(sub)
             # Re-assert the in-progress UI in case the primary scan already ended.
@@ -15029,8 +17789,12 @@ class app:
             return
         self.scan_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
+        self._lock_scan_intercept()     # re-enable Intercept now the scan is done
         self.progress.reset()
         self.graph_panel.set_scanning(False)
+        # Scan is over: the outcome badge below now wins over the pause indicator,
+        # even while requests are still queued in the proxy intercept.
+        self._scan_complete = True
         n = len(self.graph_panel.nodes)
         if self._primary_failed:
             self.status_box.fail()

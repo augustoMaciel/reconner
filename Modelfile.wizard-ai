@@ -1,14 +1,19 @@
 # Modelfile.wizard-ai
 #
 # Conversational companion model for Reconner's animated Wizard assistant.
-# Same base + hardware envelope as reconner-ai (GTX 1650 / i5-10th / 16 GB),
-# but tuned for an interactive, multi-turn CHAT rather than one-shot analysis:
-# the Wizard speaks in a playful "wizardy" voice while delivering precise,
-# correct penetration-testing / AppSec guidance.
+# Built on the strongest local coder model available — Qwen3-Coder 30B — for the
+# best pentest / AppSec reasoning Ollama can offer for free, on-device. Tuned for
+# an interactive, multi-turn CHAT rather than one-shot analysis: the Wizard speaks
+# in a playful "wizardy" voice while delivering precise, correct guidance.
+#
+# Note: 30B (~18 GB) far exceeds a 4 GB GPU, so most layers run on CPU/RAM —
+# answers are much stronger but slower than a 7B. On a tight box, override with a
+# smaller base, e.g.  BASE=qwen2.5:14b ./build-reconner-ai.sh  (9 GB, fits 16 GB
+# RAM) or  BASE=qwen2.5-coder:7b ./build-reconner-ai.sh  (fast).
 #
 # Build:  ollama create wizard-ai -f Modelfile.wizard-ai
 
-FROM qwen2.5-coder:7b-instruct-q4_K_M
+FROM qwen3-coder:30b
 
 # ─────────────────────────────────────────────────────────────────────────
 # Persona
@@ -46,7 +51,7 @@ Hard rules:
 - Correctness over flavour, always. If a flourish would muddy a technical fact, drop the flourish."""
 
 # ─────────────────────────────────────────────────────────────────────────
-# Sampling — a touch more entropy than reconner-ai for personality + variety,
+# Sampling — a touch more entropy for personality + variety,
 # sized for short conversational turns.
 # ─────────────────────────────────────────────────────────────────────────
 PARAMETER temperature      0.65
@@ -59,7 +64,9 @@ PARAMETER stop "<|im_end|>"
 PARAMETER stop "<|endoftext|>"
 
 # ─────────────────────────────────────────────────────────────────────────
-# Hardware tuning (GTX 1650 4 GB / i5-10th 6 cores / 16 GB RAM) — see
-# Modelfile.reconner-ai for notes; force num_gpu lower if you hit CUDA OOM.
+# Hardware tuning. With a 30B base on a 4 GB GPU, Ollama auto-offloads most
+# layers to CPU/RAM (num_gpu is left to Ollama's autodetect). num_thread matches
+# the 6-core i5; raise it on a bigger CPU. If first-token latency is too high,
+# rebuild with a smaller base (see the header note).
 # ─────────────────────────────────────────────────────────────────────────
 PARAMETER num_thread 6
