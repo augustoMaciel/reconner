@@ -469,20 +469,8 @@ def _panel(parent, title='', **kw):
     return f
 
 
-# Fixed character width of the 'Subdomains:' menubuttons (graph panel + Tech Scan
-# popup) so they never resize with a long host name — the name is truncated with
-# a leading ellipsis instead.
+# Fixed character width of the 'Subdomain' dropdowns (graph panel + Tech Scan).
 SUBDOMAIN_BTN_W = 30
-
-
-def _subdomain_btn_text(host):
-    """Label for a 'Subdomains:' menubutton: 'Subdomains: <host> ▾' with the host
-    truncated (leading …) to fit the fixed button width."""
-    if not host:
-        return 'Subdomains ▾'
-    budget = max(6, SUBDOMAIN_BTN_W - len('Subdomains:  ▾'))
-    short = host if len(host) <= budget else '…' + host[-(budget - 1):]
-    return f'Subdomains: {short} ▾'
 
 
 class Btn(tk.Button):
@@ -1061,21 +1049,23 @@ def arm_menu_autoclose(menu, owner, delay=170):
         m.bind('<Motion>', lambda _e, mm=m: on_motion(mm), add='+')
 
 
-def bind_rightclick_menu(root, menu):
-    """Right-click ANYWHERE inside `root` (and its current descendants) posts
-    `menu` — the same menu an Options ▾ menubutton drops — at the cursor. `menu`
-    may be a `tk.Menu` or a no-arg callable returning one. Widgets that already
-    have their own <Button-3> handler (e.g. a tree's context menu) are left alone
-    so this doesn't clobber them."""
+def bind_rightclick_menu(root, opener):
+    """Right-click ANYWHERE inside `root` (and its current descendants) opens the
+    Options dropdown at the cursor. `opener` is either an `opener(x_root, y_root)`
+    callable (e.g. a scroll_menu button's `.open_menu`) or a `tk.Menu` to tk_popup.
+    Widgets that already have their own <Button-3> handler (e.g. a tree's context
+    menu) are left alone so this doesn't clobber them."""
     def post(ev):
-        m = menu() if callable(menu) else menu
-        if m is None:
+        if callable(opener):
+            opener(ev.x_root, ev.y_root)
+            return 'break'
+        if opener is None:
             return None
         try:
-            m.tk_popup(ev.x_root, ev.y_root)
+            opener.tk_popup(ev.x_root, ev.y_root)
         finally:
             try:
-                m.grab_release()
+                opener.grab_release()
             except tk.TclError:
                 pass
         return 'break'
@@ -7788,59 +7778,20 @@ class GraphPanel(tk.Frame):
         ctrl = tk.Frame(self, bg=C['bg'])
         ctrl.pack(fill='x', padx=4, pady=2)
         self._ctrl = ctrl
-        # Subdomains selector — one entry per discovered host; selecting one shows
-        # its tree. Empty/disabled until a host is added.
+        # Subdomain selector (static label) — empty/disabled until a host is added.
         self._subdomain_var = tk.StringVar(value='')
-        self.subdomain_btn = tk.Menubutton(ctrl, text='Subdomains ▾', bg=C['btn'],
-                                           activebackground=C['btn'], relief='raised',
-                                           bd=2, font=C['font'], padx=6,
-                                           highlightthickness=0, state='disabled',
-                                           width=self._SUB_BTN_W, anchor='w')
-        self._subdomain_menu = tk.Menu(self.subdomain_btn, tearoff=0, bg=C['btn'],
-                                       fg=C['black'], activebackground=C['sel_bg'],
-                                       activeforeground=C['sel_fg'], font=C['font'])
-        self.subdomain_btn.config(menu=self._subdomain_menu)
+        self._subdomain_hosts = []
+        self.subdomain_btn = scroll_menu(ctrl, 'Subdomain', self._subdomain_items,
+                                         width=self._SUB_BTN_W)
+        self.subdomain_btn.config(state='disabled')
         self.subdomain_btn.pack(side='left', padx=2)
-
-        menu_btn = tk.Menubutton(ctrl, text='Options ▾', bg=C['btn'],
-                                 activebackground=C['btn'], relief='raised',
-                                 bd=2, font=C['font'], padx=6, highlightthickness=0)
-        menu = tk.Menu(menu_btn, tearoff=0, bg=C['btn'], fg=C['black'],
-                       activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
-                       font=C['font'])
-        menu.add_command(label='Expand all', command=self._expand_all)
-        menu.add_command(label='Collapse all', command=self._collapse_all)
-        if self.on_clear:
-            menu.add_separator()
-            menu.add_command(label='Clear', command=self.on_clear)
-        menu.add_separator()
-        if self.on_save_json:
-            menu.add_command(label='Export JSON', command=self.on_save_json)
-        if self.on_save_json_all:
-            menu.add_command(label='Export ALL graphs (JSON)',
-                             command=self.on_save_json_all)
-        if self.on_load_json:
-            menu.add_separator()
-            menu.add_command(label='Load scan JSON…', command=self.on_load_json)
-        # Per-type visibility filters — now a 'Filter' submenu OF Options
-        # (one checkbox per node type).
-        fmenu = tk.Menu(menu, tearoff=0, bg=C['btn'], fg=C['black'],
-                        activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
-                        font=C['font'])
+        # Per-type visibility filters (one toggle per node type, shown in Options).
         for label in ('page', 'file', 'redirect', 'script', 'endpoint', 'shell'):
-            var = tk.BooleanVar(value=True)
-            self.type_vars[label] = var
-            fmenu.add_checkbutton(label=label, variable=var, command=self._redraw)
-        menu.add_separator()
-        menu.add_cascade(label='Filter', menu=fmenu)
-        menu_btn.config(menu=menu)
-        menu_btn.pack(side='right', padx=2)   # Options sits top-right of the bar
-        self._options_menu = menu
-        self._filter_menu = fmenu
-        # Hover-driven open/close for the Options tree (recurses into Filter) and
-        # the Subdomains dropdown.
-        self._arm_ctx_dismiss(self._options_menu)
-        arm_menu_autoclose(self._subdomain_menu, self)
+            self.type_vars[label] = tk.BooleanVar(value=True)
+        # Options dropdown (static label, scroll_menu) — top-right of the bar.
+        self._options_btn = scroll_menu(ctrl, 'Options', self._options_items,
+                                        width=10)
+        self._options_btn.pack(side='right', padx=2)
 
         # The tree itself (single column; the implicit tree column shows the
         # arrow + icon + name).
@@ -8147,40 +8098,54 @@ class GraphPanel(tk.Frame):
         if not scanning:
             self._schedule_build()
 
+    # ── Options + Subdomain dropdown items ────────────────────────────
+    def _options_items(self):
+        """Items for the Options dropdown — view/export commands plus the per-type
+        Filter toggles (✓ when shown; clicking one toggles it and reopens)."""
+        items = [('Expand all', self._expand_all),
+                 ('Collapse all', self._collapse_all)]
+        if self.on_clear:
+            items.append(('Clear', self.on_clear))
+        if self.on_save_json:
+            items.append(('Export JSON', self.on_save_json))
+        if self.on_save_json_all:
+            items.append(('Export ALL graphs (JSON)', self.on_save_json_all))
+        if self.on_load_json:
+            items.append(('Load scan JSON…', self.on_load_json))
+        for t in ('page', 'file', 'redirect', 'script', 'endpoint', 'shell'):
+            mark = '☑' if self.type_vars[t].get() else '☐'
+            items.append(('Filter  %s %s' % (mark, t),
+                          lambda t=t: self._toggle_filter(t)))
+        return items
+
+    def _toggle_filter(self, t):
+        self.type_vars[t].set(not self.type_vars[t].get())
+        self._redraw()
+        self._options_btn.open_menu()        # reopen so several can be toggled
+
+    def _subdomain_items(self):
+        return [(h, (lambda h=h: self._activate(h)))
+                for h in getattr(self, '_subdomain_hosts', [])]
+
     # ── Subdomains dropdown ───────────────────────────────────────────
     def _add_subdomain_entry(self, host: str):
-        """Add a host to the Subdomains dropdown (idempotent) and enable it."""
-        if not hasattr(self, '_subdomain_menu'):
+        """Add a host to the Subdomain dropdown (idempotent) and enable it."""
+        if not hasattr(self, '_subdomain_hosts'):
             return
-        end = self._subdomain_menu.index('end')
-        for i in range(0, (end + 1) if end is not None else 0):
-            if self._subdomain_menu.entrycget(i, 'label') == host:
-                return
-        self._subdomain_menu.add_radiobutton(
-            label=host, value=host, variable=self._subdomain_var,
-            command=lambda h=host: self._activate(h))
-        self.subdomain_btn.config(state='normal')
+        if host and host not in self._subdomain_hosts:
+            self._subdomain_hosts.append(host)
+            self.subdomain_btn.config(state='normal')
 
     def _set_subdomain_label(self, host: str):
-        """Set the Subdomains button label to the selected `host` (no 'Subdomains:'
-        prefix), truncated (leading …) to the panel's narrow button width."""
+        """Track the selected `host` (the button always shows a static 'Subdomain
+        ▾' — the chosen subdomain is not displayed)."""
         self._subdomain_var.set(host)
-        if not host:
-            self.subdomain_btn.config(text='Subdomains ▾')
-            return
-        budget = max(6, self._SUB_BTN_W - len(' ▾'))
-        short = host if len(host) <= budget else '…' + host[-(budget - 1):]
-        self.subdomain_btn.config(text=f'{short} ▾')
 
     def _reset_subdomain_menu(self):
-        """Clear and disable the Subdomains dropdown (no hosts discovered yet)."""
-        if hasattr(self, '_subdomain_menu'):
-            try:
-                self._subdomain_menu.delete(0, 'end')
-            except Exception:
-                pass
+        """Clear and disable the Subdomain dropdown (no hosts discovered yet)."""
+        self._subdomain_hosts = []
         if hasattr(self, 'subdomain_btn'):
-            self.subdomain_btn.config(text='Subdomains ▾', state='disabled')
+            self.subdomain_btn.config(state='disabled')
         if hasattr(self, '_subdomain_var'):
             self._subdomain_var.set('')
 
@@ -8305,17 +8270,17 @@ class GraphPanel(tk.Frame):
 
     # ── right-click context menus ─────────────────────────────────────
     def _on_right_click(self, ev):
-        """Post the per-node tool menu when right-clicking a row, else the
-        background (Options + Filter) menu."""
+        """Post the per-node tool menu when right-clicking a row, else open the
+        Options dropdown at the cursor."""
         iid = self.tree.identify_row(ev.y)
-        if iid:
-            self.tree.selection_set(iid)
-            self.selected = iid
-            if self.on_select and iid in self.nodes:
-                self.on_select(self.nodes[iid])
-            menu = self._build_node_menu(iid)
-        else:
-            menu = self._build_background_menu()
+        if not iid:
+            self._options_btn.open_menu(ev.x_root, ev.y_root)
+            return
+        self.tree.selection_set(iid)
+        self.selected = iid
+        if self.on_select and iid in self.nodes:
+            self.on_select(self.nodes[iid])
+        menu = self._build_node_menu(iid)
         if menu is None:
             return
         self._ctx_menu = menu
@@ -8323,16 +8288,6 @@ class GraphPanel(tk.Frame):
             menu.tk_popup(ev.x_root, ev.y_root)
         finally:
             menu.grab_release()
-
-    def _build_background_menu(self):
-        """A context menu offering the Options and Filter dropdowns as cascades."""
-        m = tk.Menu(self, tearoff=0, bg=C['btn'], fg=C['black'],
-                    activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
-                    font=C['font'])
-        if getattr(self, '_options_menu', None) is not None:
-            m.add_cascade(label='Options', menu=self._options_menu)
-        self._arm_ctx_dismiss(m)
-        return m
 
     def _build_node_menu(self, url):
         """A context menu of the inspector's per-node tools for the node at `url`,
@@ -8461,37 +8416,11 @@ class InfoPanel(tk.Frame):
         # Explicit height makes the button exactly 1px taller than its natural
         # 18px (symmetric pady/bd can only add even pixels).
         btns.place(relx=1.0, rely=0.0, anchor='ne', x=-4, y=2, height=19)
-        # Per-node actions live in a single "Options" dropdown (same style as the
-        # Site Structure graph's Options menu) to keep the inspector header compact.
-        opt_btn = tk.Menubutton(btns, text='Options ▾', bg=C['btn'],
-                                activebackground=C['btn'], relief='raised',
-                                bd=1, pady=0, font=C['font'], padx=6,
-                                highlightthickness=0)
-        menu = tk.Menu(opt_btn, tearoff=0, bg=C['btn'], fg=C['black'],
-                       activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
-                       font=C['font'])
-        menu.add_command(label='Send to Repeater', command=self._open_repeater)
-        menu.add_command(label='Send to Fuzzer', command=self._open_fuzzer)
-        menu.add_separator()
-        menu.add_command(label='Set Shell', command=self._set_shell)
-        # 'Open Shell' stays disabled (greyed) until a shell-type node is
-        # selected; show()/clear() toggle this entry by its index.
-        menu.add_command(label='Open Shell', command=self._open_shell,
-                         state='disabled')
-        self._open_shell_idx = menu.index('end')
-        # Encode / Decode cascades over the node's selected text (Content / Req /
-        # Resp boxes).
-        menu.add_separator()
-        build_codec_submenus(
-            menu, lambda: [self.content_txt, self.req_txt, self.resp_txt], self)
-        build_sign_submenu(
-            menu, lambda: [self.content_txt, self.req_txt, self.resp_txt], self)
-        build_crack_submenu(
-            menu, lambda: [self.content_txt, self.req_txt, self.resp_txt], self)
-        arm_menu_autoclose(menu, self)        # close on pointer-leave
-        opt_btn.config(menu=menu)
-        opt_btn.pack(side='left', fill='y')   # fill the placed (19px) height
-        self._opt_menu = menu
+        # Per-node actions in a single static-labelled "Options ▾" dropdown
+        # (scroll_menu — same look/animation as every other dropdown).
+        self._opt_btn = scroll_menu(btns, 'Options', self._opt_items, width=10)
+        self._opt_btn.config(bd=1, pady=0)    # fit the placed (19px) header height
+        self._opt_btn.pack(side='left', fill='y')
 
         # Tab: Overview
         t0 = tk.Frame(nb, bg=C['bg'])
@@ -8560,7 +8489,18 @@ class InfoPanel(tk.Frame):
         sf, self.resp_txt = self._scrolled_text(resp_col)
         sf.pack(fill='both', expand=True, pady=(2, 0))
         # Right-click anywhere in the inspector opens the same Options menu.
-        bind_rightclick_menu(self, self._opt_menu)
+        bind_rightclick_menu(self, self._opt_btn.open_menu)
+
+    def _opt_items(self):
+        """Items for the inspector's Options dropdown — node actions plus the
+        Encode/Decode·Sign·Crack toolkit. Open Shell appears only on a shell node."""
+        sel = lambda: [self.content_txt, self.req_txt, self.resp_txt]
+        items = [('Send to Repeater', self._open_repeater),
+                 ('Send to Fuzzer', self._open_fuzzer),
+                 ('Set Shell', self._set_shell)]
+        if self.node is not None and getattr(self.node, 'node_type', '') == 'shell':
+            items.append(('Open Shell', self._open_shell))
+        return items + toolkit_items(sel, self)
 
     def _scrolled_text(self, parent, **kw):
         """Read-only Text95 with a vertical scrollbar; adds a horizontal
@@ -8592,11 +8532,7 @@ class InfoPanel(tk.Frame):
         self.ov_vars['status'].set(node_status_label(node))
         self.ov_vars['title'].set(node.title or '—')
         self.ov_vars['ctype'].set(node.content_type or '—')
-        # Open Shell only works on a shell-type node.
-        self._opt_menu.entryconfig(
-            self._open_shell_idx,
-            state=('normal' if node.node_type == 'shell' else 'disabled'))
-
+        # (Open Shell shows in the Options dropdown only for a shell-type node.)
         self.links_lb.delete(0, 'end')
         for lnk in node.links:
             self.links_lb.insert('end', lnk)
@@ -8615,7 +8551,6 @@ class InfoPanel(tk.Frame):
     def clear(self):
         """Reset the inspector to its empty state (no node selected)."""
         self.node = None
-        self._opt_menu.entryconfig(self._open_shell_idx, state='disabled')
         for k in self.ov_vars:
             self.ov_vars[k].set('')
         self.links_lb.delete(0, 'end')
@@ -9102,7 +9037,7 @@ class SettingsDialog(ModalToplevel):
         page = tk.Frame(nb, bg=C['bg'], padx=14, pady=14)
         nb.add(page, text='  About  ')
 
-        tk.Label(page, text='Reconner  v2.0', bg=C['bg'], fg=C['black'],
+        tk.Label(page, text='Reconner  v2.1', bg=C['bg'], fg=C['black'],
                  font=('MS Sans Serif', 12, 'bold')).pack(anchor='w')
         tk.Label(page, text='AI-powered bug bounty reconnaissance tool.',
                  bg=C['bg'], fg=C['black'], font=C['font']).pack(anchor='w', pady=(4, 10))
@@ -9221,15 +9156,10 @@ class FingerprintDialog(ModalToplevel):
         tk.Label(head, text='Technologies detected:', bg=C['bg'],
                  font=C['font_b']).pack(side='left')
         self._host_var = tk.StringVar(value='')
-        self.host_btn = tk.Menubutton(head, text='Subdomains ▾', bg=C['btn'],
-                                      activebackground=C['btn'], relief='raised',
-                                      bd=2, font=C['font'], padx=6,
-                                      highlightthickness=0, state='disabled',
-                                      width=SUBDOMAIN_BTN_W, anchor='w')
-        self._host_menu = tk.Menu(self.host_btn, tearoff=0, bg=C['btn'],
-                                  fg=C['black'], activebackground=C['sel_bg'],
-                                  activeforeground=C['sel_fg'], font=C['font'])
-        self.host_btn.config(menu=self._host_menu)
+        self._host_list = []        # [(label, target_url)]
+        self.host_btn = scroll_menu(head, 'Subdomain', self._host_items,
+                                    width=SUBDOMAIN_BTN_W)
+        self.host_btn.config(state='disabled')
         self.host_btn.pack(side='right')
         fp_frame = tk.Frame(wrap, bg=C['bg'])
         fp_frame.pack(fill='both', expand=True, pady=(2, 6))
@@ -9251,23 +9181,21 @@ class FingerprintDialog(ModalToplevel):
         py = parent.winfo_rooty() + parent.winfo_height() // 2 - 280
         self.geometry(f'720x560+{max(px, 0)}+{max(py, 0)}')
 
+    def _host_items(self):
+        return [(label, (lambda u=url: self.on_select and self.on_select(u)))
+                for label, url in self._host_list]
+
     def set_hosts(self, hosts, current=None):
-        """Populate the Subdomains dropdown. `hosts` is a list of (host_label,
+        """Populate the Subdomain dropdown. `hosts` is a list of (host_label,
         target_url); selecting one calls on_select(target_url)."""
-        self._host_menu.delete(0, 'end')
-        for label, url in hosts:
-            self._host_menu.add_radiobutton(
-                label=label, value=url, variable=self._host_var,
-                command=lambda u=url: (self.on_select and self.on_select(u)))
+        self._host_list = list(hosts)
         self.host_btn.config(state=('normal' if hosts else 'disabled'))
         if current:
             self.set_host_label(current)
 
     def set_host_label(self, target):
-        """Set the Subdomains button label to `target`'s host."""
-        host = _host_only(urlparse(target).netloc) or target
+        """Track the selected host (the button shows a static 'Subdomain ▾')."""
         self._host_var.set(target)
-        self.host_btn.config(text=_subdomain_btn_text(host))
 
     def set_fingerprint(self, text: str):
         """Show `text` in the fingerprint pane."""
@@ -9500,9 +9428,9 @@ class RequestEditorDialog(ModalToplevel):
         self.geometry(f'960x720+{max(px, 0)}+{max(py, 0)}')
         # Right-click anywhere opens the same Options menu (per editor region; the
         # Data Out subtree is bound first so it keeps its own menu).
-        bind_rightclick_menu(self.out_frame, self._codec_btn2.codec_menu)
-        bind_rightclick_menu(self.in_frame, self._codec_btn.codec_menu)
-        bind_rightclick_menu(self, self._codec_btn.codec_menu)
+        bind_rightclick_menu(self.out_frame, self._codec_btn2.open_menu)
+        bind_rightclick_menu(self.in_frame, self._codec_btn.open_menu)
+        bind_rightclick_menu(self, self._codec_btn.open_menu)
 
     def _switch_view(self):
         """Show the Data In or Data Out frame per the radio selection."""
@@ -9954,7 +9882,7 @@ class FuzzerDialog(ModalToplevel):
         py = parent.winfo_rooty() + parent.winfo_height() // 2 - 400
         self.geometry(f'1080x800+{max(px, 0)}+{max(py, 0)}')
         # Right-click anywhere in the Fuzzer opens the same Options menu.
-        bind_rightclick_menu(self, self._codec_btn.codec_menu)
+        bind_rightclick_menu(self, self._codec_btn.open_menu)
 
     # ── results listbox ─────────────────────────────────────────────
     def _add_header_row(self):
@@ -11025,62 +10953,220 @@ def exclusive_checks(parent, var, options, command=None, side='left',
     return cbs
 
 
-def fill_dropdown(mb, options):
-    """(Re)populate a styled_dropdown's options; keeps the var's current value if
-    still valid else picks the first. The selected value is shown left with the ▾
-    pushed to the RIGHT border, and the menu entries are padded so the popup is the
-    same width as the button (combobox-like)."""
-    from tkinter import font as _tkfont
-    menu = mb._dd_menu
-    menu.delete(0, 'end')
-    f = _tkfont.Font(font=C['font'])
+_pick_pop = None    # the single open scroll-pick popup, app-wide
+
+
+def scroll_pick(anchor, items, on_pick, height=12, min_width=0, at=None):
+    """Pop a scrollable, menu-styled list under `anchor` — the same widget + feel as
+    the Wizard popup's dropdowns: a gray `tk.Listbox` with a raised border, menu-like
+    hover-highlight that follows the cursor, mouse-wheel scroll, and dismissal on
+    Escape / outside-click / pointer-leave. `on_pick(value)` fires on selection. Used
+    app-wide so every value dropdown looks and behaves identically. `at=(x_root,
+    y_root)` opens the popup at that screen point (for right-click) instead of under
+    the anchor."""
+    global _pick_pop
+    if _pick_pop is not None:
+        try:
+            _pick_pop.destroy()
+        except Exception:
+            pass
+        _pick_pop = None
+    items = list(items or [])
+    if not items:
+        return None
+    root = anchor.winfo_toplevel()
+    top = tk.Toplevel(anchor, bg=C['btn'])
+    _pick_pop = top
+    top.overrideredirect(True)
+    inner = tk.Frame(top, bg=C['btn'], relief='raised', bd=2)
+    inner.pack()
+    width = max(min_width, max(16, min(40, max(len(s) for s in items) + 1)))
+    lb = tk.Listbox(inner, height=min(height, len(items)), width=width,
+                    bg=C['btn'], fg=C['black'], font=C['font'], activestyle='none',
+                    selectbackground=C['sel_bg'], selectforeground=C['sel_fg'],
+                    relief='flat', bd=0, highlightthickness=0, exportselection=False)
+    for it in items:
+        lb.insert('end', it)
+    lb.pack(fill='both', expand=True)
+
+    def _hover(e):
+        i = lb.nearest(e.y)
+        if i >= 0:
+            lb.selection_clear(0, 'end')
+            lb.selection_set(i)
+            lb.activate(i)
+    lb.bind('<Motion>', _hover)
+
+    out_id = [None]
+
+    def close():
+        global _pick_pop
+        if _pick_pop is top:
+            _pick_pop = None
+        if out_id[0] is not None:
+            try:
+                root.unbind('<Button-1>', out_id[0])
+            except Exception:
+                pass
+            out_id[0] = None
+        try:
+            top.destroy()
+        except Exception:
+            pass
+
+    def choose(_e=None):
+        sel = lb.curselection()
+        if not sel:
+            return
+        val = items[sel[0]]
+        close()
+        on_pick(val)
+
+    lb.bind('<ButtonRelease-1>', choose)
+    lb.bind('<Return>', choose)
+    lb.bind('<Escape>', lambda _e: close())
+    top.bind('<Escape>', lambda _e: close())
+    lb.bind('<Button-4>', lambda _e: lb.yview_scroll(-1, 'units'))
+    lb.bind('<Button-5>', lambda _e: lb.yview_scroll(1, 'units'))
+    lb.bind('<MouseWheel>',
+            lambda e: lb.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
+
+    leave_after = [None]
+
+    def _cancel_leave(_e=None):
+        if leave_after[0] is not None:
+            try:
+                root.after_cancel(leave_after[0])
+            except Exception:
+                pass
+            leave_after[0] = None
+
+    def _sched_leave(_e=None):
+        _cancel_leave()
+        try:
+            leave_after[0] = root.after(200, close)
+        except Exception:
+            pass
+    for w in (top, inner, lb):
+        w.bind('<Enter>', _cancel_leave, add='+')
+        w.bind('<Leave>', _sched_leave, add='+')
+
+    def _click_outside(e):
+        if _pick_pop is None:
+            return
+        try:
+            wx, wy = top.winfo_rootx(), top.winfo_rooty()
+            inside = (wx <= e.x_root < wx + top.winfo_width()
+                      and wy <= e.y_root < wy + top.winfo_height())
+        except tk.TclError:
+            inside = False
+        if not inside:
+            close()
+
+    anchor.update_idletasks()
+    if at is not None:
+        x, y = at
+    else:
+        x, y = anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height()
+    top.geometry('+%d+%d' % (x, y))
+    top.lift()
+    lb.focus_set()
+    out_id[0] = root.bind('<Button-1>', _click_outside, add='+')
+    return top
+
+
+def _dd_settext(b, v):
+    """Set a styled_dropdown button's text: the value left, the ▾ at the RIGHT
+    border (space-padded via font measurement when the button has a fixed width)."""
     try:
-        w_chars = int(mb.cget('width')) or 0
+        w_chars = int(b.cget('width')) or 0
     except Exception:
         w_chars = 0
     if not w_chars:
-        w_chars = max((len(o) for o in options), default=1)
+        b.config(text='%s  ▾' % v)
+        return
+    from tkinter import font as _tkfont
+    f = _tkfont.Font(font=C['font'])
     sp = max(1, f.measure(' '))
-    target = w_chars * f.measure('0')        # button inner width in px (approx)
+    pad = max(1, (w_chars * f.measure('0') - f.measure(v) - f.measure('▾')) // sp)
+    b.config(text=v + ' ' * pad + '▾')
 
-    def fmt_btn(v):
-        pad = max(1, (target - f.measure(v) - f.measure('▾')) // sp)
-        return v + ' ' * pad + '▾'
 
-    def menu_label(o):
-        return o + ' ' * max(0, (target - f.measure(o)) // sp)
-
-    def pick(v):
-        mb._dd_var.set(v)
-        mb.config(text=fmt_btn(v))
-        if mb._dd_command:
-            mb._dd_command(v)
-    for o in options:
-        menu.add_command(label=menu_label(o), command=lambda v=o: pick(v))
-    cur = mb._dd_var.get()
-    if cur not in options:
-        cur = options[0] if options else ''
-        mb._dd_var.set(cur)
-    mb.config(text=fmt_btn(cur))
+def fill_dropdown(b, options):
+    """(Re)populate a styled_dropdown's options; keeps the var's current value if
+    still valid else picks the first, and refreshes the button text."""
+    b._dd_options = list(options)
+    cur = b._dd_var.get()
+    if cur not in b._dd_options:
+        cur = b._dd_options[0] if b._dd_options else ''
+        b._dd_var.set(cur)
+    _dd_settext(b, cur)
 
 
 def styled_dropdown(parent, var, options, command=None, width=None):
-    """An app-style dropdown (Menubutton + Menu, like the Options ▾ menus) bound to
-    StringVar `var`; `command(value)` fires on pick. `width` is in characters (size
-    it to the longest label so nothing crops). Repopulate via fill_dropdown()."""
-    mb = tk.Menubutton(parent, text='', bg=C['btn'], activebackground=C['btn'],
-                       relief='raised', bd=2, font=C['font'], padx=6,
-                       highlightthickness=0, anchor='w')
+    """A value dropdown bound to StringVar `var`, rendered as a `Btn` (value left, ▾
+    at the right border) that opens the Wizard-style `scroll_pick` popup on click —
+    so every dropdown in the app shares one look + animation. `command(value)` fires
+    on pick. `width` is in characters (size it to the longest label so nothing
+    crops). Repopulate via fill_dropdown()."""
+    b = Btn(parent, text='', anchor='w', font=C['font'])
     if width:
-        mb.config(width=width)
-    menu = tk.Menu(mb, tearoff=0, bg=C['btn'], fg=C['black'],
-                   activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
-                   font=C['font'])
-    mb.config(menu=menu)
-    mb._dd_menu, mb._dd_var, mb._dd_command = menu, var, command
-    fill_dropdown(mb, options)
-    arm_menu_autoclose(menu, mb)
-    return mb
+        b.config(width=width)
+    b._dd_var, b._dd_command, b._dd_options = var, command, list(options)
+
+    def _pick(v):
+        b._dd_var.set(v)
+        _dd_settext(b, v)
+        if b._dd_command:
+            b._dd_command(v)
+    b.config(command=lambda: scroll_pick(b, b._dd_options, _pick,
+                                         min_width=int(b.cget('width') or 0)))
+    fill_dropdown(b, options)
+    return b
+
+
+def _menu_btn_settext(b, label):
+    """Set a scroll_menu button's STATIC text: `label` left, the ▾ at the right
+    border (space-padded via font measurement when the button has a fixed width)."""
+    try:
+        w_chars = int(b.cget('width')) or 0
+    except Exception:
+        w_chars = 0
+    if not w_chars:
+        b.config(text='%s ▾' % label)
+        return
+    from tkinter import font as _tkfont
+    f = _tkfont.Font(font=C['font'])
+    sp = max(1, f.measure(' '))
+    pad = max(1, (w_chars * f.measure('0') - f.measure(label)
+                  - f.measure('▾')) // sp)
+    b.config(text=label + ' ' * pad + '▾')
+
+
+def scroll_menu(parent, label, items, width=None):
+    """A command dropdown with a STATIC '<label> ▾' button (▾ at the right border)
+    that opens the Wizard-style `scroll_pick` popup on click — same look/animation as
+    every other dropdown. `items` is a list of `(text, command)` (or a callable
+    returning one, rebuilt each open); picking a row runs its command. Returns the
+    `Btn`; `b.open_menu(x_root=None, y_root=None)` opens the popup (right-click)."""
+    b = Btn(parent, text='', anchor='w', font=C['font'])
+    if width:
+        b.config(width=width)
+    _menu_btn_settext(b, label)
+    b._sm_items = items
+
+    def open_menu(x=None, y=None):
+        its = list(b._sm_items() if callable(b._sm_items) else b._sm_items)
+        if not its:
+            return
+        cmds = {t: c for t, c in its}
+        scroll_pick(b, [t for t, _c in its],
+                    lambda v: (cmds.get(v) or (lambda: None))(),
+                    min_width=int(b.cget('width') or 0),
+                    at=((x, y) if x is not None else None))
+    b.config(command=open_menu)
+    b.open_menu = open_menu
+    return b
 
 
 # ── Encode / Decode of a highlighted selection (Base64 / Hex / URL / Octal) ──
@@ -11204,37 +11290,30 @@ class _CodecDialog(tk.Toplevel):
         self.clipboard_append(self.out.get('1.0', 'end-1c'))
 
 
-def build_codec_submenus(menu, widgets, popup_parent):
-    """Add a single **Encode / Decode** command to `menu` — it opens the
-    Encode/Decode workbench (`_CodecDialog`) seeded with the current text selection
-    of `widgets`. The popup itself offers every direction + coding (Base64 / Hex /
-    URL / Octal), so there are no submenus."""
-    menu.add_command(
-        label='Encode / Decode',
-        command=lambda: _CodecDialog(popup_parent, 'base64', False,
-                                     initial=_menu_selection(widgets)))
+def toolkit_items(widgets, popup_parent, show_images_cb=None):
+    """The shared `(label, command)` items for an Options ▾ dropdown — **Encode /
+    Decode**, **Sign**, **Crack** (and **Show Images** when `show_images_cb` is
+    given) — each operating on the current text selection of `widgets`."""
+    items = [
+        ('Encode / Decode',
+         lambda: _CodecDialog(popup_parent, 'base64', False,
+                              initial=_menu_selection(widgets))),
+        ('Sign', lambda: _SignDialog(popup_parent, _menu_selection(widgets))),
+        ('Crack', lambda: _CrackDialog(popup_parent, _menu_selection(widgets))),
+    ]
+    if show_images_cb is not None:
+        items.append(('Show Images', show_images_cb))
+    return items
 
 
 def build_codec_menus(parent, widgets, side='right', show_images_cb=None):
-    """A single **Options ▾** Menubutton whose menu holds the Encode/Decode
-    command over the selection of `widgets`, the Sign + Crack submenus, and — when
-    `show_images_cb` is given — a **Show Images** command. Returns the Menubutton."""
-    b = tk.Menubutton(parent, text='Options ▾', bg=C['btn'],
-                      activebackground=C['btn'], relief='raised', bd=2,
-                      font=C['font'], padx=6, highlightthickness=0)
-    m = tk.Menu(b, tearoff=0, bg=C['btn'], fg=C['black'],
-                activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
-                font=C['font'])
-    b.config(menu=m)
-    build_codec_submenus(m, widgets, parent)
-    build_sign_submenu(m, widgets, parent)
-    build_crack_submenu(m, widgets, parent)
-    if show_images_cb is not None:
-        m.add_separator()
-        m.add_command(label='Show Images', command=show_images_cb)
-    arm_menu_autoclose(m, b)          # close when the pointer leaves the dropdown
+    """A single static-labelled **Options ▾** dropdown (`scroll_menu`) holding the
+    toolkit items (Encode/Decode, Sign, Crack, Show Images) over `widgets`. Returns
+    the Btn — `.open_menu` opens it (panels wire it to right-click)."""
+    b = scroll_menu(parent, 'Options',
+                    lambda: toolkit_items(widgets, parent, show_images_cb),
+                    width=10)
     b.pack(side=side, padx=2)
-    b.codec_menu = m                  # exposed so panels can post it on right-click
     return b
 
 
@@ -11975,15 +12054,6 @@ def _menu_selection(widgets):
     return ''
 
 
-def build_sign_submenu(menu, widgets, popup_parent):
-    """Add a single **Sign** command to `menu` — it opens the unified signing popup
-    (`_SignDialog`) seeded with the current text selection of `widgets`. Method +
-    algorithm are picked inside the popup, which shows every widget and greys out
-    the ones the chosen method doesn't use. No separator — Encode/Decode, Sign and
-    Crack stay in one section."""
-    menu.add_command(
-        label='Sign',
-        command=lambda: _SignDialog(popup_parent, _menu_selection(widgets)))
 
 
 # ─────────────────────────────────────────────
@@ -12295,13 +12365,6 @@ class _CrackDialog(tk.Toplevel):
 
 
 
-def build_crack_submenu(menu, widgets, popup_parent):
-    """Add a single **Crack** command to `menu` — it opens the unified cracking
-    popup (`_CrackDialog`) seeded with the current text selection of `widgets`. No
-    separator — it sits in the same section as Encode/Decode and Sign."""
-    menu.add_command(
-        label='Crack',
-        command=lambda: _CrackDialog(popup_parent, _menu_selection(widgets)))
 
 
 
@@ -13243,8 +13306,6 @@ class _ProxyHandler(socketserver.StreamRequestHandler):
         if not ctrl.intercept_response(flow):
             return False        # dropped → close
 
-        # Manual Open-Browser session: live-inject the element-highlight overlay.
-        ctrl.maybe_inject_highlight(flow)
         self._write_response(wfile, flow)
         ctrl.note_node(flow)
         # Honour an explicit close request from either side.
@@ -13331,10 +13392,6 @@ class InterceptProxy:
         self.port = int(port)
         self.ca = ProxyCA()
         self.intercept = False
-        # When True (set while the Open-Browser manual session is live), HTML
-        # responses get a small overlay script injected that draws a red rectangle
-        # over each element as the user uses it (the whole form when it's in one).
-        self.highlight_browser = False
         self.scope_re = None
         self._server = None
         self._thread = None
@@ -13345,63 +13402,6 @@ class InterceptProxy:
         self.on_node = on_node
         self.on_status = on_status
         self.ui_call = ui_call or (lambda fn: fn())
-
-    # Self-contained overlay injected into HTML pages during a manual Open-Browser
-    # session: draws a red rectangle over each element as it is used (focus / click
-    # / input). When the element belongs to a <form>, every visible non-hidden
-    # control of that form is boxed at once (e.g. username + password + submit) —
-    # the same form-aware logic the old Show-Element screenshot used, but live in
-    # the real DOM. Boxes are cleared on scroll/resize (fixed to the viewport).
-    _HIGHLIGHT_JS = """
-<script>(function(){
-if(window.__reconnerHL)return;window.__reconnerHL=1;
-var BC='#dc1e1e';
-function clr(){var n=document.querySelectorAll('.__reconner_box');for(var i=0;i<n.length;i++){if(n[i].parentNode)n[i].parentNode.removeChild(n[i]);}}
-function box(el){var r=el.getBoundingClientRect();if(r.width<=0||r.height<=0)return;
-var d=document.createElement('div');d.className='__reconner_box';
-d.style.cssText='position:fixed;left:'+r.left+'px;top:'+r.top+'px;width:'+r.width+'px;height:'+r.height+'px;border:3px solid '+BC+';box-sizing:border-box;pointer-events:none;z-index:2147483647;';
-(document.body||document.documentElement).appendChild(d);}
-function hl(el){clr();if(!el||!el.getBoundingClientRect)return;
-var form=el.form||(el.closest?el.closest('form'):null);var list;
-if(form){list=[].slice.call(form.querySelectorAll('input,select,textarea,button,[role=button]')).filter(function(e){if(e.type==='hidden')return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0;});if(!list.length)list=[el];}else{list=[el];}
-for(var i=0;i<list.length;i++)box(list[i]);}
-document.addEventListener('focusin',function(e){hl(e.target);},true);
-document.addEventListener('click',function(e){hl(e.target);},true);
-document.addEventListener('input',function(e){hl(e.target);},true);
-window.addEventListener('scroll',clr,true);
-window.addEventListener('resize',clr,true);
-})();</script>
-"""
-
-    def maybe_inject_highlight(self, flow):
-        """While a manual Open-Browser session is active, append the overlay script
-        to HTML responses (dropping CSP so the inline script runs) so the user sees
-        a red rectangle over each element as they use it. No-op otherwise."""
-        if not self.highlight_browser:
-            return
-        ct = next((v for k, v in flow.resp_headers.items()
-                   if k.lower() == 'content-type'), '') or ''
-        if 'html' not in ct.lower():
-            return
-        body = flow.resp_body
-        if not isinstance(body, bytes):
-            return
-        try:
-            html = body.decode('utf-8', 'replace')
-        except Exception:
-            return
-        low = html.lower()
-        pos = low.rfind('</body>')
-        if pos == -1:
-            pos = low.rfind('</html>')
-        html = (html + self._HIGHLIGHT_JS) if pos == -1 \
-            else (html[:pos] + self._HIGHLIGHT_JS + html[pos:])
-        flow.resp_body = html.encode('utf-8', 'replace')
-        # Drop CSP so the injected inline script is allowed to execute.
-        flow.resp_headers = {
-            k: v for k, v in flow.resp_headers.items()
-            if k.lower() not in ('content-security-policy',
-                                 'content-security-policy-report-only')}
 
     # ── lifecycle ──
     def running(self) -> bool:
@@ -14134,7 +14134,7 @@ class ProxyPanel(tk.Frame):
         cont.pack(fill='both', expand=True, padx=6, pady=(2, 4))
         self._show_empty()
         # Right-click anywhere in the panel opens the same Options menu.
-        bind_rightclick_menu(self, self._codec_btn.codec_menu)
+        bind_rightclick_menu(self, self._codec_btn.open_menu)
 
     def _show_images(self):
         """Render any images in the currently-shown response (Options ▸ Show
@@ -15560,31 +15560,45 @@ class WizardAssistantDialog(tk.Toplevel):
         self.sched_node_btn = Btn(panel, text='Node ▾', anchor='w',
                                   command=self._sched_open_node_popup)
         self.sched_node_btn.pack(fill='x', pady=(0, 4))
-        # Task list: each task is one logical line; read-only but selectable.
-        # Selectable list (like the proxy History): a Test column + a State
-        # column, one row per scheduled test.
+        # Task list: one selectable row per scheduled test. A custom scrollable
+        # list (NOT a Treeview, which can't wrap) so a long test name WRAPS to the
+        # panel width instead of forcing a horizontal scroll.
         twrap = tk.Frame(panel, bg=C['bg'])
         twrap.pack(fill='both', expand=True, pady=(0, 4))
-        self.sched_tree = ttk.Treeview(twrap, columns=('test', 'state'),
-                                       show='headings', selectmode='browse',
-                                       height=14)
-        self.sched_tree.heading('test', text='Test')
-        self.sched_tree.heading('state', text='State')
-        # Wide, non-stretching Test column so long test names stay readable by
-        # scrolling horizontally (the panel is narrow).
-        self.sched_tree.column('test', width=320, minwidth=120, anchor='w',
-                               stretch=False)
-        self.sched_tree.column('state', width=54, minwidth=54, anchor='center',
-                               stretch=False)
-        tsb = tk.Scrollbar(twrap, orient='vertical', command=self.sched_tree.yview)
-        hsb = tk.Scrollbar(twrap, orient='horizontal',
-                           command=self.sched_tree.xview)
-        self.sched_tree.config(yscrollcommand=tsb.set, xscrollcommand=hsb.set)
-        hsb.pack(side='bottom', fill='x')
+        self._sched_canvas = tk.Canvas(twrap, bg=C['window'], highlightthickness=0,
+                                       relief='sunken', bd=2)
+        tsb = tk.Scrollbar(twrap, orient='vertical',
+                           command=self._sched_canvas.yview)
+        self._sched_canvas.config(yscrollcommand=tsb.set)
         tsb.pack(side='right', fill='y')
-        self.sched_tree.pack(side='left', fill='both', expand=True)
-        self.sched_tree.tag_configure('done', foreground='#2e7d32')
-        self.sched_tree.tag_configure('hint', foreground=C['shadow'])
+        self._sched_canvas.pack(side='left', fill='both', expand=True)
+        self._sched_rows = tk.Frame(self._sched_canvas, bg=C['window'])
+        self._sched_win = self._sched_canvas.create_window(
+            (0, 0), window=self._sched_rows, anchor='nw')
+        self._sched_sel = None              # selected test index, or None
+        self._sched_wrap = 230              # label wraplength (px), updated on size
+        self._sched_test_labels = []
+
+        def _on_canvas_resize(e):
+            self._sched_canvas.itemconfig(self._sched_win, width=e.width)
+            self._sched_wrap = max(60, e.width - 34)   # minus state col + padding
+            for lbl in self._sched_test_labels:
+                try:
+                    lbl.config(wraplength=self._sched_wrap)
+                except tk.TclError:
+                    pass
+        self._sched_canvas.bind('<Configure>', _on_canvas_resize)
+        self._sched_rows.bind(
+            '<Configure>',
+            lambda _e: self._sched_canvas.config(
+                scrollregion=self._sched_canvas.bbox('all')))
+        for seq, d in (('<MouseWheel>', None), ('<Button-4>', -1),
+                       ('<Button-5>', 1)):
+            self._sched_canvas.bind(
+                seq,
+                (lambda e: self._sched_canvas.yview_scroll(
+                    -1 if e.delta > 0 else 1, 'units')) if d is None
+                else (lambda e, d=d: self._sched_canvas.yview_scroll(d, 'units')))
         # Complete / Uncomplete the selected test (bottom right).
         bbar = tk.Frame(panel, bg=C['bg'])
         bbar.pack(fill='x', pady=(0, 8))
@@ -15620,44 +15634,70 @@ class WizardAssistantDialog(tk.Toplevel):
         self._sched_node = label
         self._sched_render()
 
+    def _sched_hint(self, text):
+        """A greyed, wrapping hint row (no node / no tests)."""
+        tk.Label(self._sched_rows, text=text, bg=C['window'], fg=C['shadow'],
+                 font=C['font'], anchor='w', justify='left',
+                 wraplength=self._sched_wrap).pack(fill='x', padx=4, pady=4)
+
+    def _sched_row(self, i, t):
+        """One selectable test row: a ✓/— state marker + the test text, which WRAPS
+        to the panel width (no horizontal scroll)."""
+        done = bool(t.get('done'))
+        sel = (self._sched_sel == i)
+        bg = C['sel_bg'] if sel else C['window']
+        fg = C['sel_fg'] if sel else ('#2e7d32' if done else C['black'])
+        row = tk.Frame(self._sched_rows, bg=bg)
+        row.pack(fill='x')
+        st = tk.Label(row, text='✓' if done else '—', bg=bg, fg=fg,
+                      font=C['font_b'], width=2)
+        st.pack(side='left', padx=(4, 2), anchor='n')
+        lbl = tk.Label(row, text=t.get('text', ''), bg=bg, fg=fg, font=C['font'],
+                       anchor='w', justify='left', wraplength=self._sched_wrap)
+        lbl.pack(side='left', fill='x', expand=True, pady=2)
+        self._sched_test_labels.append(lbl)
+        tk.Frame(self._sched_rows, bg=C['shadow'], height=1).pack(fill='x')
+        for w in (row, st, lbl):
+            w.bind('<Button-1>', lambda _e, idx=i: self._sched_select(idx))
+
+    def _sched_select(self, idx):
+        self._sched_sel = idx
+        self._sched_render()
+
     def _sched_render(self):
-        """Repaint the test list (Treeview) for the current node — one row per
-        test, the State column showing a green ✓ when done."""
-        tree = getattr(self, 'sched_tree', None)
-        if tree is None:
+        """Repaint the wrapping test list for the current node — one row per test,
+        a green ✓ when done, the selected row highlighted."""
+        rows = getattr(self, '_sched_rows', None)
+        if rows is None:
             return
         self.sched_node_btn.config(
             text=((self._sched_node or 'Node')[:34]) + ' ▾')
-        tree.delete(*tree.get_children())
+        for w in rows.winfo_children():
+            w.destroy()
+        self._sched_test_labels = []
         tasks = self.schedule.get(self._sched_node, []) if self._sched_node else []
+        if self._sched_sel is not None and not (0 <= self._sched_sel < len(tasks)):
+            self._sched_sel = None
         if not self._sched_node:
-            tree.insert('', 'end', iid='hint', tags=('hint',),
-                        values=('Pick a node, then click the orb to schedule '
-                                'tests.', ''))
+            self._sched_hint('Pick a node, then click the orb to schedule tests.')
         elif not tasks:
-            tree.insert('', 'end', iid='hint', tags=('hint',),
-                        values=('No tests yet — click the scrying-orb button to '
-                                'schedule them.', ''))
+            self._sched_hint('No tests yet — click the scrying-orb button to '
+                             'schedule them.')
         else:
             for i, t in enumerate(tasks):
-                done = bool(t.get('done'))
-                tree.insert('', 'end', iid=str(i),
-                            values=(t.get('text', ''), '✓' if done else '—'),
-                            tags=('done',) if done else ())
+                self._sched_row(i, t)
+        rows.update_idletasks()
+        try:
+            self._sched_canvas.config(scrollregion=self._sched_canvas.bbox('all'))
+        except tk.TclError:
+            pass
 
     def _sched_selected_index(self):
         """Index of the selected test row, or None."""
         tasks = self.schedule.get(self._sched_node, []) if self._sched_node else []
-        if not tasks:
+        if not tasks or self._sched_sel is None:
             return None
-        sel = self.sched_tree.selection()
-        if not sel:
-            return None
-        try:
-            i = int(sel[0])
-        except ValueError:
-            return None
-        return i if 0 <= i < len(tasks) else None
+        return self._sched_sel if 0 <= self._sched_sel < len(tasks) else None
 
     def _sched_set_done(self, done):
         """Mark the selected test done / not done, then celebrate if appropriate."""
@@ -15667,12 +15707,8 @@ class WizardAssistantDialog(tk.Toplevel):
                                 'first, then Complete / Uncomplete it.')
             return
         self.schedule[self._sched_node][i]['done'] = bool(done)
+        self._sched_sel = i                 # keep the same row selected
         self._sched_render()
-        try:                                # keep the same row selected
-            self.sched_tree.selection_set(str(i))
-            self.sched_tree.see(str(i))
-        except tk.TclError:
-            pass
         if done:
             self._sched_celebrate()
 
@@ -15802,134 +15838,9 @@ class WizardAssistantDialog(tk.Toplevel):
         self._sched_render()
 
     def _scroll_pick(self, anchor, items, on_pick, height=12):
-        """Pop a scrollable list under `anchor`, styled like the app's other menus
-        (gray, raised border — NOT a sunken text box): shows at most `height` rows
-        (the rest scroll), highlights the row under the cursor like a menu, calls
-        `on_pick(value)` on selection, and dismisses on Escape, focus-out or
-        selection. Used for long dropdowns (the attack list) where a plain Menu
-        would be unusably tall."""
-        old = getattr(self, '_pick_pop', None)
-        if old is not None:
-            try:
-                old.destroy()
-            except Exception:
-                pass
-            self._pick_pop = None
-        items = list(items or [])
-        if not items:
-            return
-        top = tk.Toplevel(self, bg=C['btn'])
-        self._pick_pop = top
-        top.overrideredirect(True)
-        # Raised gray border so it reads as a MENU, like the app's other dropdowns.
-        inner = tk.Frame(top, bg=C['btn'], relief='raised', bd=2)
-        inner.pack()
-        width = max(16, min(34, max(len(s) for s in items) + 1))
-        # The list itself is the menu grey (C['btn']) with no border — so it looks
-        # like a menu, not a sunken text field.
-        lb = tk.Listbox(inner, height=min(height, len(items)), width=width,
-                        bg=C['btn'], fg=C['black'], font=C['font'],
-                        activestyle='none', selectbackground=C['sel_bg'],
-                        selectforeground=C['sel_fg'], relief='flat', bd=0,
-                        highlightthickness=0, exportselection=False)
-        for it in items:
-            lb.insert('end', it)
-        # No scrollbar — scrolling is by mouse wheel (and arrow keys) only, bound
-        # below, so the popup stays a clean menu.
-        lb.pack(fill='both', expand=True)
+        """Wizard dropdowns use the shared, app-wide scroll-pick popup."""
+        return scroll_pick(anchor, items, on_pick, height=height)
 
-        # Menu-like hover: highlight the row under the pointer as the mouse moves.
-        def _hover(e):
-            i = lb.nearest(e.y)
-            if i >= 0:
-                lb.selection_clear(0, 'end')
-                lb.selection_set(i)
-                lb.activate(i)
-        lb.bind('<Motion>', _hover)
-
-        outside_id = [None]
-
-        def close():
-            if getattr(self, '_pick_pop', None) is top:
-                self._pick_pop = None
-            if outside_id[0] is not None:
-                try:
-                    self.unbind('<Button-1>', outside_id[0])
-                except Exception:
-                    pass
-                outside_id[0] = None
-            try:
-                top.destroy()
-            except Exception:
-                pass
-
-        def choose(_e=None):
-            sel = lb.curselection()
-            if not sel:
-                return
-            val = items[sel[0]]
-            close()
-            on_pick(val)
-
-        lb.bind('<ButtonRelease-1>', choose)
-        lb.bind('<Return>', choose)
-        lb.bind('<Escape>', lambda _e: close())
-        top.bind('<Escape>', lambda _e: close())
-        lb.bind('<Button-4>', lambda _e: lb.yview_scroll(-1, 'units'))
-        lb.bind('<Button-5>', lambda _e: lb.yview_scroll(1, 'units'))
-        lb.bind('<MouseWheel>',
-                lambda e: lb.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
-
-        # Auto-close when the pointer leaves the popup (same feel as the dropdown
-        # menus). A short grace + enter-cancel means moving between its own widgets
-        # or scrolling won't dismiss it — only leaving the whole popup does. The
-        # anchor is a plain Btn, so clicking it reopens cleanly (no stale state).
-        leave_after = [None]
-
-        def _cancel_leave(_e=None):
-            if leave_after[0] is not None:
-                try:
-                    self.after_cancel(leave_after[0])
-                except Exception:
-                    pass
-                leave_after[0] = None
-
-        def _schedule_leave(_e=None):
-            _cancel_leave()
-            try:
-                leave_after[0] = self.after(200, close)
-            except Exception:
-                pass
-
-        for w in (top, inner, lb):
-            w.bind('<Enter>', _cancel_leave, add='+')
-            w.bind('<Leave>', _schedule_leave, add='+')
-
-        # Dismiss on a click OUTSIDE the popup — NOT on focus-out. A focus-
-        # follows-mouse WM fires <FocusOut> just from moving the cursor, which was
-        # closing the menu on every mouse move (the close/work/close pattern).
-        # Clicks inside the listbox live in a separate toplevel, so they don't
-        # trigger this dialog-level binding.
-        def _click_outside(e):
-            t = getattr(self, '_pick_pop', None)
-            if t is None:
-                return
-            try:
-                wx, wy = t.winfo_rootx(), t.winfo_rooty()
-                inside = (wx <= e.x_root < wx + t.winfo_width()
-                          and wy <= e.y_root < wy + t.winfo_height())
-            except tk.TclError:
-                inside = False
-            if not inside:
-                close()
-
-        anchor.update_idletasks()
-        x = anchor.winfo_rootx()
-        y = anchor.winfo_rooty() + anchor.winfo_height()
-        top.geometry('+%d+%d' % (x, y))
-        top.lift()
-        lb.focus_set()
-        outside_id[0] = self.bind('<Button-1>', _click_outside, add='+')
 
     # ── lightweight markdown rendering (chat + KB pane) ──
     _MD_FENCE = re.compile(r'```[ \t]*[\w.+-]*[ \t]*\n?(.*?)```', re.DOTALL)
@@ -16495,41 +16406,36 @@ class gui:
             command=app._open_settings).pack(side='right', padx=2)
 
     def _build_modes_menu(self, parent):
-        """The Modes dropdown (styled like the graph's Menu button): two grouped
-        choices that are always both active — the scan INTENSITY (Stealth /
-        Normal / Aggressive) and the scan TYPE (Browser crawl / Fuzzing)."""
+        """The Modes dropdown (static-label scroll_menu — same look as the others):
+        two grouped choices that are always both active — the scan INTENSITY
+        (Stealth / Normal / Aggressive) and the scan TYPE (Browser / Fuzzing). The
+        active choice in each group is marked ●; the menu reopens after a pick so
+        you can set the other group too."""
         app = self.app
         app.scan_mode_var = tk.StringVar(value=DEFAULT_SCAN_MODE)
         app.scan_type_var = tk.StringVar(value='browser')
-        btn = tk.Menubutton(parent, text='Modes ▾', bg=C['btn'],
-                            activebackground=C['btn'], relief='raised', bd=2,
-                            font=C['font'], padx=6, highlightthickness=0)
-        menu = tk.Menu(btn, tearoff=0, bg=C['btn'], fg=C['black'],
-                       activebackground=C['sel_bg'], activeforeground=C['sel_fg'],
-                       font=C['font'])
-        descs = {
-            'Stealth':    'slip under WAF / rate limits, don\'t disrupt the target',
-            'Normal':     'balanced footprint, standard probes',
-            'Aggressive': 'no throttle, every probe — doesn\'t spare the service',
-        }
-        menu.add_command(label='Intensity', state='disabled')
-        for m in ('Stealth', 'Normal', 'Aggressive'):
-            menu.add_radiobutton(
-                label=f'{m}  ·  {descs[m]}', value=m, variable=app.scan_mode_var,
-                command=lambda mm=m: app._status(f'Scan mode: {mm}'))
-        menu.add_separator()
-        menu.add_command(label='Type', state='disabled')
-        type_descs = {
-            'browser': ('Browser', 'crawl & navigate the target like a user'),
-            'fuzzing': ('Fuzzing', 'path-wordlist discovery only, no browser, '
-                                   'no whitelist'),
-        }
-        for val, (lbl, d) in type_descs.items():
-            menu.add_radiobutton(
-                label=f'{lbl}  ·  {d}', value=val, variable=app.scan_type_var,
-                command=lambda vv=val: app._status(
-                    f'Scan type: {vv.capitalize()}'))
-        btn.config(menu=menu)
+
+        def pick_mode(m):
+            app.scan_mode_var.set(m)
+            app._status(f'Scan mode: {m}')
+            btn.open_menu()
+
+        def pick_type(v):
+            app.scan_type_var.set(v)
+            app._status(f'Scan type: {v.capitalize()}')
+            btn.open_menu()
+
+        def items():
+            out = [('—  Intensity  —', None)]
+            for m in ('Stealth', 'Normal', 'Aggressive'):
+                mark = '●' if app.scan_mode_var.get() == m else '○'
+                out.append(('%s %s' % (mark, m), (lambda mm=m: pick_mode(mm))))
+            out.append(('—  Type  —', None))
+            for val, lbl in (('browser', 'Browser'), ('fuzzing', 'Fuzzing')):
+                mark = '●' if app.scan_type_var.get() == val else '○'
+                out.append(('%s %s' % (mark, lbl), (lambda vv=val: pick_type(vv))))
+            return out
+        btn = scroll_menu(parent, 'Modes', items, width=14)
         btn.pack(side='left', padx=2)
 
     # ── statusbar matrix + build ──────────────────────────────────────
@@ -16903,11 +16809,8 @@ class app:
     # ── open the system browser through the proxy ────────────────────
     def _open_browser(self):
         """Launch the system browser routed through the proxy (CA trusted) so the
-        user can browse and the proxy intercepts. While the browser is open the
-        proxy injects a live overlay that draws a red rectangle over each element
-        as it is used (the whole form when the element belongs to one). Best-effort
-        across Firefox then Chromium; falls back to a message with the CA path +
-        manual steps."""
+        user can browse and the proxy intercepts. Best-effort across Firefox then
+        Chromium; falls back to a message with the CA path + manual steps."""
         self.proxy.start()
         port = self.proxy.port
         # Open the SELECTED node's URL if one is selected, else the target if set,
@@ -16918,8 +16821,6 @@ class app:
                else self.target_var.get().strip())
         try:
             if self._launch_firefox(url, port) or self._launch_chromium(url, port):
-                self.proxy.highlight_browser = True   # proxy injects the overlay
-                self._watch_browser_proc()            # off again when it closes
                 return
         except Exception as e:
             self._status(f'Browser launch error: {e}')
@@ -16928,18 +16829,6 @@ class app:
             'Could not auto-launch a browser through the proxy.\n\n'
             f'Point your browser at proxy 127.0.0.1:{port} and trust the CA at:\n'
             f'{PROXY_CA_CERT}')
-
-    def _watch_browser_proc(self):
-        """Poll the manual-explore browser process; once it exits, stop the proxy's
-        element-highlight injection so ordinary scan traffic isn't rewritten."""
-        proc = getattr(self, '_browser_proc', None)
-        if proc is not None and proc.poll() is None:
-            self.root.after(1500, self._watch_browser_proc)
-            return
-        try:
-            self.proxy.highlight_browser = False
-        except Exception:
-            pass
 
     def _launch_firefox(self, url, port):
         """Launch Firefox/Firefox-ESR in a dedicated Reconner profile configured
